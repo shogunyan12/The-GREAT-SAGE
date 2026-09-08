@@ -4128,6 +4128,125 @@ Hey Ciel</textarea>
   const shardGroup = new THREE.Group(); // outer, independent drift
   worldGroup.add(shardGroup);
 
+  // ---------------- RAPHAEL ----------------
+  // A second scene, not a recolour. Krazaa's reference is a white star
+  // burning inside stacked bands of ornate script, with the cage and the
+  // drifting debris gone entirely - so Raphael ADDS these and HIDES those,
+  // and Great Sage is left exactly as it was.
+  //
+  // Drawn to a canvas and mapped onto a flat plane, which is how the
+  // existing magic circle already works (see magicCircleTex). The bands
+  // face the camera in the reference; there is nothing to gain from
+  // building them as real geometry in depth.
+  function makeRuneBandTexture(size, count, innerFrac, outerFrac, weight) {
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const g = c.getContext('2d');
+    const cx = size / 2, cy = size / 2;
+    const rMid = size * (innerFrac + outerFrac) * 0.5;
+    const bandH = size * (outerFrac - innerFrac);
+
+    g.strokeStyle = 'rgba(255,255,255,0.95)';
+    g.lineCap = 'round';
+    g.lineJoin = 'round';
+
+    // The two hairlines that fence the band in, as in every frame.
+    g.lineWidth = Math.max(1.5, size * 0.0018);
+    [innerFrac, outerFrac].forEach(function (f) {
+      g.beginPath();
+      g.arc(cx, cy, size * f, 0, Math.PI * 2);
+      g.stroke();
+    });
+
+    // The script itself. Deterministic per slot rather than random, so the
+    // band is identical every launch - a ring of glyphs that reshuffled on
+    // each start would read as noise rather than as writing.
+    for (let i = 0; i < count; i++) {
+      const a = (i / count) * Math.PI * 2;
+      g.save();
+      g.translate(cx + Math.cos(a) * rMid, cy + Math.sin(a) * rMid);
+      g.rotate(a + Math.PI / 2);
+      g.lineWidth = weight;
+
+      const seed = Math.sin(i * 12.9898) * 43758.5453;
+      const rnd = seed - Math.floor(seed);
+      const seed2 = Math.sin(i * 78.233) * 12345.6789;
+      const rnd2 = seed2 - Math.floor(seed2);
+
+      const h = bandH * (0.42 + rnd * 0.26);
+      const w = bandH * (0.16 + rnd2 * 0.16);
+
+      g.beginPath();
+      g.moveTo(0, -h / 2);
+      g.lineTo(0, h / 2);                       // the stem
+      // Hooks and bars hung off it - enough variety that the eye reads
+      // letterforms rather than tally marks.
+      if (rnd > 0.30) { g.moveTo(0, -h / 2); g.lineTo(w, -h / 2 + w * 0.7); }
+      if (rnd > 0.62) { g.moveTo(0, h / 2); g.lineTo(-w, h / 2 - w * 0.7); }
+      if (rnd2 > 0.45) { g.moveTo(-w * 0.8, 0); g.lineTo(w * 0.8, 0); }
+      if (rnd2 > 0.78) { g.moveTo(-w * 0.6, -h * 0.22); g.lineTo(w * 0.6, -h * 0.22); }
+      g.stroke();
+      if (rnd > 0.85) {
+        g.beginPath();
+        g.arc(w * 0.5, h * 0.30, weight * 0.9, 0, Math.PI * 2);
+        g.fill();
+      }
+      g.restore();
+    }
+    const tex = new THREE.CanvasTexture(c);
+    tex.anisotropy = 4;
+    return tex;
+  }
+
+  const raphaelGroup = new THREE.Group();
+  raphaelGroup.visible = false;      // Great Sage is the default
+  worldGroup.add(raphaelGroup);
+
+  function makeRuneBand(planeSize, tex, opacity) {
+    const mat = new THREE.MeshBasicMaterial({
+      map: tex,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      opacity: opacity,
+      color: new THREE.Color(0xffcf6a),   // retinted by the theme colour
+    });
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(planeSize, planeSize), mat);
+    raphaelGroup.add(mesh);
+    return mesh;
+  }
+
+  // Three bands at increasing radius. The outermost is the one the
+  // reference lets run off the edge of frame, so it is deliberately
+  // larger than the viewport and faint.
+  const runeInner = makeRuneBand(9.0,
+    makeRuneBandTexture(1024, 54, 0.30, 0.40, 4.5), 0.95);
+  const runeOuter = makeRuneBand(15.5,
+    makeRuneBandTexture(1536, 96, 0.355, 0.435, 4.0), 0.7);
+  const runeBorder = makeRuneBand(30.0,
+    makeRuneBandTexture(2048, 150, 0.40, 0.465, 4.0), 0.32);
+  runeInner.position.z = 0.02;
+  runeOuter.position.z = 0.01;
+  runeBorder.position.z = -0.4;
+
+  // What Raphael replaces. Named here rather than inline so the answer to
+  // "what does this theme actually change" is one readable list.
+  const GREAT_SAGE_ONLY = [cubeRingGroup, outerCubeRingGroup, shardGroup,
+                          magicCircle, geometryGroup];
+
+  function applyThemeScene(id) {
+    const raphael = (id === 'raphael');
+    raphaelGroup.visible = raphael;
+    GREAT_SAGE_ONLY.forEach(function (o) { if (o) o.visible = !raphael; });
+    // The mobius ribbons are a bare array of meshes rather than a group,
+    // so they are switched here instead of in the list above.
+    if (typeof ribbonMeshes !== 'undefined') {
+      ribbonMeshes.forEach(function (r) { if (r) r.visible = !raphael; });
+    }
+  }
+  window.__applyThemeScene = applyThemeScene;
+
+
   function makeShard() {
     const w = 0.1 + Math.random() * 0.22;
     const h = 0.08 + Math.random() * 0.16;
@@ -6604,6 +6723,15 @@ const MINI_CHAT_PAD = 3;
 
     warpUniforms.uTime.value = t * 10;
 
+    // Raphael's bands turn against each other. Different rates and
+    // opposite directions, because three rings turning together read as
+    // one disc rather than as stacked writing.
+    if (raphaelGroup.visible) {
+      runeInner.rotation.z += 0.0016 * frameScale;
+      runeOuter.rotation.z -= 0.0011 * frameScale;
+      runeBorder.rotation.z += 0.0004 * frameScale;
+    }
+
     // Magic circle drifts very slowly and ripples ever so slightly
     magicCircleMat.uniforms.uTime.value = t * 10;
     magicCircle.rotation.z += 0.00025;
@@ -7082,6 +7210,13 @@ const MINI_CHAT_PAD = 3;
   function applyThemeColor(hex) {
     const color = new THREE.Color(hex);
     themableMaterials.forEach(mat => mat.color.set(color));
+    // Raphael's script takes the theme colour too, so the gold slider
+    // moves the whole look together instead of leaving the bands behind.
+    if (typeof raphaelGroup !== 'undefined') {
+      raphaelGroup.children.forEach(function (m) {
+        if (m.material && m.material.color) m.material.color.set(color);
+      });
+    }
     octagonUniforms.uColor.value.set(color);
     coreSphereMat.uniforms.uColor.value.set(color);
     // The core beam is a DOM element (#core-pole), so it isn't in
@@ -8341,24 +8476,30 @@ const MINI_CHAT_PAD = 3;
     // the look are the magic circle (those glyph rings ARE the image)
     // and the lasers (the spears). Both go up hard.
     raphael: {
-      // White-gold core, gold accent, deep teal base for the fringe.
-      'theme-color-picker': '#ffe6a8',
-      'bg-accent-color-picker': '#e8a317',
-      'bg-base-color-picker': '#14453f',
-      // The glyph rings are the signature of the whole image.
-      'magic-circle-opacity-slider': '120',
-      'magic-circle-slider': '110',
-      // The spears of light thrown outward.
-      'laser-opacity-slider': '150',
-      'rings-slider': '160',
-      // Bloom and chromatic spill - the reference is drowning in it.
-      'chroma-slider': '180',
-      'refract-slider': '150',
-      'corner-warp-slider': '40',
-      'speaking-glow-slider': '300',
-      // Denser motes, matching the sparks packed through the frame.
-      'particle-count-slider': '260',
-      'infall-count-slider': '320',
+      // GOLD, not teal. The first pass took the base colour from the
+      // green fringe at the very corners of the reference and ended up
+      // with a teal scene - but the frame is overwhelmingly gold, and
+      // the fringe is chromatic spill at the edges, not the field.
+      'theme-color-picker': '#fff0c4',
+      'bg-accent-color-picker': '#ffbf3a',
+      'bg-base-color-picker': '#7a4a08',
+      // A star, not a spark. The reference core is a broad white-gold
+      // burn with the glare thrown off it, so the core carries far more
+      // of the frame than Great Sage's tight point does.
+      'core-scale-slider': '155',
+      'speaking-glow-slider': '340',
+      // The spears of light.
+      'laser-opacity-slider': '170',
+      'rings-slider': '150',
+      // Blown out and smeared - the reference is drowning in bloom and
+      // chromatic spill.
+      'chroma-slider': '200',
+      'refract-slider': '160',
+      'corner-warp-slider': '55',
+      // Bokeh, not debris. The sharp shards belong to Great Sage and are
+      // hidden; these are the soft motes drifting through the burn.
+      'particle-count-slider': '210',
+      'infall-count-slider': '150',
       'outer-ring-scale-slider': '100',
       // The upgrade Krazaa named: eight sides become twelve.
       'octagon-sides-slider': '12',
@@ -8414,6 +8555,9 @@ const MINI_CHAT_PAD = 3;
     themeStore[activeTheme] = captureTheme();
     activeTheme = next;
     applyThemeValues(themeStore[next] || THEME_SEEDS[next] || null);
+    // The values are only half of it. Raphael also adds and removes
+    // whole objects - see applyThemeScene.
+    if (window.__applyThemeScene) window.__applyThemeScene(next);
     scheduleSaveSettings();
   }
 
@@ -8475,6 +8619,9 @@ const MINI_CHAT_PAD = 3;
       // settings ARE the active theme - re-applying here would fight it.
       activeTheme = saved['active-theme'];
       if (themeSelect) themeSelect.value = activeTheme;
+      // Restoring a saved theme has to bring its objects back too, not
+      // just its slider values.
+      if (window.__applyThemeScene) window.__applyThemeScene(activeTheme);
     }
     if (typeof saved['sfx-gains'] === 'string') {
       try {
