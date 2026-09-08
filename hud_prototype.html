@@ -4219,32 +4219,170 @@ Hey Ciel</textarea>
   // Three bands at increasing radius. The outermost is the one the
   // reference lets run off the edge of frame, so it is deliberately
   // larger than the viewport and faint.
-  const runeInner = makeRuneBand(9.0,
-    makeRuneBandTexture(1024, 54, 0.30, 0.40, 4.5), 0.95);
-  const runeOuter = makeRuneBand(15.5,
-    makeRuneBandTexture(1536, 96, 0.355, 0.435, 4.0), 0.7);
-  const runeBorder = makeRuneBand(30.0,
-    makeRuneBandTexture(2048, 150, 0.40, 0.465, 4.0), 0.32);
+  // Sized off the reference rather than guessed: the first circle of
+  // script covers most of the frame, the second runs out past the
+  // corners, and a thin hoop sits just outside the twelve-sided ring.
+  const runeInner = makeRuneBand(11.5,
+    makeRuneBandTexture(1024, 40, 0.355, 0.395, 3.5), 0.8);
+  const runeOuter = makeRuneBand(19.0,
+    makeRuneBandTexture(2048, 74, 0.30, 0.425, 7.0), 1.0);
+  const runeBorder = makeRuneBand(36.0,
+    makeRuneBandTexture(2048, 120, 0.355, 0.455, 6.0), 0.55);
   runeInner.position.z = 0.02;
   runeOuter.position.z = 0.01;
   runeBorder.position.z = -0.4;
 
   // What Raphael replaces. Named here rather than inline so the answer to
   // "what does this theme actually change" is one readable list.
+  // ---- Water, and the blur of stars moving through it ----
+  // "Lots of blurry stars circling and watery ripples flowing around the
+  // gap between the two circles", and nothing thrown out of the core -
+  // Raphael has no debris, no infall, no shooters. What fills the frame
+  // instead is depth: soft lights drifting behind moving water.
+
+  // The bokeh. Soft, large, and slow - these are out-of-focus lights, so
+  // a crisp one anywhere in the field breaks the illusion instantly.
+  const bokehTex = (function () {
+    const size = 128;
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const g = c.getContext('2d');
+    const grad = g.createRadialGradient(size / 2, size / 2, 0,
+                                        size / 2, size / 2, size / 2);
+    // Not a plain falloff: a faint bright rim just inside the edge is
+    // what makes a defocused highlight read as a lens circle rather than
+    // as a fuzzy dot.
+    grad.addColorStop(0.00, 'rgba(255,255,255,0.85)');
+    grad.addColorStop(0.55, 'rgba(255,235,190,0.45)');
+    grad.addColorStop(0.86, 'rgba(255,220,150,0.30)');
+    grad.addColorStop(0.94, 'rgba(255,245,215,0.42)');
+    grad.addColorStop(1.00, 'rgba(255,255,255,0)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, size, size);
+    return new THREE.CanvasTexture(c);
+  })();
+
+  const bokehGroup = new THREE.Group();
+  raphaelGroup.add(bokehGroup);
+  const bokehLights = [];
+  for (let i = 0; i < 110; i++) {
+    const mat = new THREE.SpriteMaterial({
+      map: bokehTex,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      opacity: 0.16 + Math.random() * 0.42,
+      color: new THREE.Color(0xffd98a),
+    });
+    const sp = new THREE.Sprite(mat);
+    // Spread through the whole annulus between the two circles of script,
+    // which is the gap the reference fills.
+    const radius = 2.6 + Math.random() * 14.5;
+    const angle = Math.random() * Math.PI * 2;
+    const scale = 0.30 + Math.random() * 1.5;
+    sp.scale.setScalar(scale);
+    sp.position.set(Math.cos(angle) * radius, Math.sin(angle) * radius,
+                    -0.6 + Math.random() * 1.0);
+    bokehLights.push({
+      sprite: sp,
+      radius: radius,
+      angle: angle,
+      // Nearer lights drift faster. Uniform speed reads as a turntable;
+      // a spread of speeds reads as depth.
+      speed: (0.00016 + Math.random() * 0.00055) * (Math.random() < 0.4 ? -1 : 1),
+      bobPhase: Math.random() * Math.PI * 2,
+      bobRate: 0.4 + Math.random() * 1.1,
+      baseScale: scale,
+    });
+    bokehGroup.add(sp);
+  }
+
+  // The water. Concentric ripples travelling outward, refracting what is
+  // behind them - the "looking through water" of the reference, done as a
+  // single additive sheet rather than as real distortion, which would
+  // need the scene rendered to a target first for no visible gain at
+  // this blur.
+  const rippleMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 },
+      uColor: { value: new THREE.Color(0xffd070) },
+      uStrength: { value: 0.5 },
+    },
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      varying vec2 vUv;
+      uniform float uTime;
+      uniform vec3 uColor;
+      uniform float uStrength;
+
+      void main() {
+        vec2 p = vUv - 0.5;
+        float r = length(p);
+        float a = atan(p.y, p.x);
+
+        // Three ripple trains at different speeds and wavelengths. One
+        // alone reads as a target; three interfering read as a surface.
+        float w = sin(r * 46.0 - uTime * 1.5)
+                + sin(r * 27.0 - uTime * 0.9 + a * 2.0) * 0.7
+                + sin(r * 71.0 - uTime * 2.2 - a * 3.0) * 0.4;
+        w = w * 0.5 + 0.5;
+
+        // Only in the gap: faded out at the core and again past the
+        // outer circle, so the water never washes over either of them.
+        float inner = smoothstep(0.055, 0.16, r);
+        float outer = 1.0 - smoothstep(0.34, 0.5, r);
+        float band = inner * outer;
+
+        float v = pow(w, 3.0) * band * uStrength;
+        gl_FragColor = vec4(uColor * v, v * 0.85);
+      }
+    `,
+  });
+  const rippleSheet = new THREE.Mesh(new THREE.PlaneGeometry(30, 30), rippleMat);
+  rippleSheet.position.z = -0.5;
+  raphaelGroup.add(rippleSheet);
+
   const GREAT_SAGE_ONLY = [cubeRingGroup, outerCubeRingGroup, shardGroup,
-                          magicCircle, geometryGroup];
+                          magicCircle, geometryGroup, starField];
+
+  // Remembered, so anything that disturbs visibility can put the theme
+  // back without needing to know which one is on - see applyMiniMode.
+  let appliedThemeScene = 'great-sage';
 
   function applyThemeScene(id) {
+    appliedThemeScene = id;
     const raphael = (id === 'raphael');
     raphaelGroup.visible = raphael;
     GREAT_SAGE_ONLY.forEach(function (o) { if (o) o.visible = !raphael; });
-    // The mobius ribbons are a bare array of meshes rather than a group,
-    // so they are switched here instead of in the list above.
-    if (typeof ribbonMeshes !== 'undefined') {
-      ribbonMeshes.forEach(function (r) { if (r) r.visible = !raphael; });
-    }
+    // Loose arrays rather than groups, so they are switched here instead
+    // of in the list above.
+    //
+    // The shooters and the infall dots are the things thrown out of and
+    // pulled into the core. Krazaa: they "don't exist in the Raphael
+    // version" - what fills that space instead is the bokeh and the
+    // water, which are depth rather than debris.
+    [typeof ribbonMeshes !== 'undefined' ? ribbonMeshes : null,
+     typeof shooters !== 'undefined' ? shooters : null,
+     typeof infallDots !== 'undefined' ? infallDots : null]
+      .forEach(function (arr) {
+        if (!arr) return;
+        arr.forEach(function (o) {
+          const m = (o && o.isObject3D) ? o : (o && o.mesh) || (o && o.sprite);
+          if (m) m.visible = !raphael;
+        });
+      });
   }
   window.__applyThemeScene = applyThemeScene;
+  window.__reapplyThemeScene = function () { applyThemeScene(appliedThemeScene); };
 
 
   function makeShard() {
@@ -4406,6 +4544,11 @@ Hey Ciel</textarea>
     } else {
       worldGroup.children.forEach((child) => { child.visible = true; });
       shards.forEach((s) => { s.visible = true; });
+      // ...which has just un-hidden everything the ACTIVE THEME hides.
+      // Leaving the overlay would otherwise bring Great Sage's cage and
+      // debris back on top of Raphael, and they would stay until the
+      // theme was switched by hand. Put the theme back.
+      if (window.__reapplyThemeScene) window.__reapplyThemeScene();
     }
     document.body.classList.toggle('mini', on);
     document.documentElement.classList.toggle('mini', on);
@@ -4736,7 +4879,8 @@ const MINI_CHAT_PAD = 3;
   }
   starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
   const starMat = new THREE.PointsMaterial({ color: 0x6f96c9, size: 0.03, transparent: true, opacity: 0.6 });
-  worldGroup.add(new THREE.Points(starGeo, starMat));
+  const starField = new THREE.Points(starGeo, starMat);
+  worldGroup.add(starField);
 
   // ---------- Amplitude envelope ----------
   // Driven entirely by real playback (via the Web Audio analyser wired up
@@ -6730,6 +6874,17 @@ const MINI_CHAT_PAD = 3;
       runeInner.rotation.z += 0.0016 * frameScale;
       runeOuter.rotation.z -= 0.0011 * frameScale;
       runeBorder.rotation.z += 0.0004 * frameScale;
+      rippleMat.uniforms.uTime.value = t * 6.0;
+      // The lights circle rather than sit still, each at its own rate,
+      // breathing slightly so the field never looks frozen.
+      for (let i = 0; i < bokehLights.length; i++) {
+        const b = bokehLights[i];
+        b.angle += b.speed * frameScale;
+        b.sprite.position.x = Math.cos(b.angle) * b.radius;
+        b.sprite.position.y = Math.sin(b.angle) * b.radius;
+        b.sprite.scale.setScalar(
+          b.baseScale * (1 + Math.sin(t * b.bobRate + b.bobPhase) * 0.13));
+      }
     }
 
     // Magic circle drifts very slowly and ripples ever so slightly
@@ -7216,6 +7371,12 @@ const MINI_CHAT_PAD = 3;
       raphaelGroup.children.forEach(function (m) {
         if (m.material && m.material.color) m.material.color.set(color);
       });
+      if (typeof bokehLights !== 'undefined') {
+        bokehLights.forEach(function (b) { b.sprite.material.color.set(color); });
+      }
+      if (typeof rippleMat !== 'undefined') {
+        rippleMat.uniforms.uColor.value.set(color);
+      }
     }
     octagonUniforms.uColor.value.set(color);
     coreSphereMat.uniforms.uColor.value.set(color);
