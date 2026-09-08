@@ -280,6 +280,12 @@ def check_tdz(js):
     # Which function body every offset belongs to. 0 is the script itself.
     body_at = [0] * (n + 1)
     depth_at = [0] * (n + 1)
+    # A function's PARAMETERS sit outside its own braces, so they land at
+    # the depth of the code around it - which puts "function f(i)" at the
+    # same depth as a "for (let i = 0; ...)" further down and reports the
+    # parameter as reading it early. Parameters are names being bound, not
+    # values being read, so they are masked out here.
+    in_params = [False] * (n + 1)
     body_of_brace = {}     # brace depth -> body id opened at that depth
     depth = 0
     stack = [0]
@@ -309,6 +315,20 @@ def check_tdz(js):
         elif (c == "f" and src.startswith("function", i)
               and not (i and (src[i - 1].isalnum() or src[i - 1] in "_$."))):
             pending_fn = True
+            open_paren = src.find("(", i)
+            brace = src.find("{", i)
+            if open_paren != -1 and (brace == -1 or open_paren < brace):
+                par, j = 0, open_paren
+                while j < n:
+                    if src[j] == "(":
+                        par += 1
+                    elif src[j] == ")":
+                        par -= 1
+                        if par == 0:
+                            break
+                    j += 1
+                for k in range(open_paren, min(j + 1, n)):
+                    in_params[k] = True
         body_at[i] = stack[-1]
         depth_at[i] = depth
         i += 1
@@ -328,7 +348,8 @@ def check_tdz(js):
     for m in _IDENT.finditer(src):
         name = m.group(1)
         at = m.start(1)
-        if name in _KEYWORDS or _is_object_key(src, m.start(1), m.end(1)):
+        if (name in _KEYWORDS or in_params[at]
+                or _is_object_key(src, m.start(1), m.end(1))):
             continue
         decl_at = declared.get((body_at[at], depth_at[at], name))
         if decl_at is None or at >= decl_at:

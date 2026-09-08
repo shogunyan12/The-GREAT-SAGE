@@ -83,3 +83,6 @@ ai_settings.json
 
 # Scheduled reminders and folder watches - personal.
 tasks.json
+/_preview_raphael.html
+/.claude/launch.json
+/hud_settings.json.bak

@@ -2015,6 +2015,16 @@ body.mini:hover #mini-exit { opacity: 1; }
         </details>
 
         <details class="settings-group">
+          <summary>Bloom &amp; glare</summary>
+          <label class="slider-label">Bloom</label>
+          <input type="range" id="bloom-slider" min="0" max="300" value="100">
+          <label class="slider-label">Glow spread</label>
+          <input type="range" id="bloom-spread-slider" min="40" max="260" value="100">
+          <label class="slider-label">Glare rays</label>
+          <input type="range" id="glare-slider" min="0" max="300" value="100">
+        </details>
+
+        <details class="settings-group">
           <summary>Panel</summary>
           <label class="slider-label">Darkness (0 = see-through, 100 = solid)</label>
           <input type="range" id="panel-darkness-slider" min="0" max="100" value="60">
@@ -2447,6 +2457,10 @@ Hey Ciel</textarea>
       Math.max(2, Math.floor(h / BG_PIXEL_DIVISOR))
     );
     fgTarget.setSize(...fgTargetSize());
+    for (let i = 0; i < BLOOM_LEVELS; i++) {
+      bloomA[i].setSize(...bloomSize(i));
+      bloomB[i].setSize(...bloomSize(i));
+    }
     // The dilation offsets are in texels, so they have to follow the
     // target's new size or the lines would thicken/thin with the window.
     fgComposite.material.uniforms.uTexel.value.set(1 / fgTarget.width, 1 / fgTarget.height);
@@ -2519,6 +2533,8 @@ Hey Ciel</textarea>
         uniform float uDilate;  // line thickening, in texels of uTex (0 = off)
         uniform vec2 uTexel;    // 1.0 / uTex's pixel size
         uniform float uChroma;  // chromatic aberration intensity (0 = off)
+        uniform float uGain;    // exposure on this pass (1 = untouched)
+        uniform vec3 uLift;     // black level (0 = untouched)
 
         // Rough spectral ramp, red through green to blue. Used to tint
         // each tap of the smear below so the fringe comes out as layered
@@ -2667,6 +2683,9 @@ Hey Ciel</textarea>
             float lum = dot(col, vec3(0.299, 0.587, 0.114));
             col = mix(vec3(lum), col, 1.0 + mask * uChroma * 1.1);
           }
+          // Raphael runs this above 1 with a warm lift; Great Sage
+          // leaves it at exactly 1 and 0, so its output is bit-identical.
+          col = col * uGain + uLift;
           gl_FragColor = vec4(col, base.a);
         }
       `
@@ -2690,6 +2709,8 @@ Hey Ciel</textarea>
       uDilate: { value: 0.0 },
       uTexel: { value: new THREE.Vector2(0.0, 0.0) },
       uChroma: { value: 1.0 }, // "Colour fringing" slider in settings
+      uGain: { value: 1.0 },
+      uLift: { value: new THREE.Vector3(0, 0, 0) },
     },
     false
   );
@@ -2722,9 +2743,199 @@ Hey Ciel</textarea>
       uChroma: { value: 0.0 },  // model stays clean - fringing is background-only
       uFisheye: { value: 0.0 }, // and undistorted - the warp is background-only
       uAspect: { value: window.innerWidth / window.innerHeight },
+      // MUST be here even though they are the identity. See above.
+      uGain: { value: 1.0 },
+      uLift: { value: new THREE.Vector3(0, 0, 0) },
     },
     true
   );
+
+  // ---------- Bloom and glare (Raphael only) ----------
+  // Krazaa's reference is a photograph of a light, not a drawing of one:
+  // the core is blown out past white, everything bright bleeds into what
+  // is beside it, and the whole frame sits in a warm haze with no true
+  // black anywhere. None of that can come from the scene itself. An
+  // additive material brightens the pixels it covers and stops there;
+  // bleeding INTO the neighbouring pixels is a screen-space job, so it
+  // happens here, between rendering the model and putting it on screen.
+  //
+  // Great Sage never runs any of this. Every pass below is skipped
+  // unless Raphael is the active theme, so its look is unchanged.
+  function makeFullscreenPass(fragment, uniforms) {
+    const mat = new THREE.ShaderMaterial({
+      uniforms: uniforms, depthWrite: false, depthTest: false,
+      vertexShader: `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = vec4(position, 1.0); }
+      `,
+      fragmentShader: fragment,
+    });
+    const sc = new THREE.Scene();
+    sc.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat));
+    return { scene: sc, material: mat };
+  }
+
+  // Three octaves. A single blur can be tight OR wide, never both, and
+  // the reference needs both at once: a hard little flare hugging the
+  // core AND a wash across the whole frame. Each level is half the size
+  // of the one above, so the same blur radius on level 2 covers four
+  // times as much screen as it does on level 0.
+  const BLOOM_LEVELS = 3;
+  function bloomSize(i) {
+    const div = 2 << i;                       // 2, 4, 8
+    return [Math.max(2, Math.floor(window.innerWidth / div)),
+            Math.max(2, Math.floor(window.innerHeight / div))];
+  }
+  const bloomA = [], bloomB = [];
+  for (let i = 0; i < BLOOM_LEVELS; i++) {
+    bloomA.push(makeTarget(...bloomSize(i)));
+    bloomB.push(makeTarget(...bloomSize(i)));
+  }
+
+  // Pass 1 - keep only what is bright enough to bleed.
+  //
+  // Thresholded on the brightest CHANNEL rather than on luminance.
+  // Luminance weights green at 0.59 and blue at 0.11, so against a gold
+  // and white scene it passed the white core and held back the gold
+  // script beside it at the same apparent brightness. The runes have to
+  // glow too; they are half the picture.
+  const bloomBright = makeFullscreenPass(`
+    varying vec2 vUv;
+    uniform sampler2D uTex;
+    uniform float uThreshold;
+    uniform float uKnee;
+    void main() {
+      vec3 c = texture2D(uTex, vUv).rgb;
+      float m = max(max(c.r, c.g), c.b);
+      // Soft knee. A hard cutoff makes the edge of the bloom crawl
+      // visibly as things drift through the threshold.
+      float k = smoothstep(uThreshold, uThreshold + uKnee, m);
+      gl_FragColor = vec4(c * k, 1.0);
+    }
+  `, {
+    uTex: { value: null },
+    uThreshold: { value: 0.52 },
+    uKnee: { value: 0.34 },
+  });
+
+  // Pass 2 - separable Gaussian. ONE material, redirected between draws:
+  // two materials built from this same source would share a single
+  // WebGLProgram, and uniform values live on the program rather than on
+  // the material (the fgComposite note above is the same trap).
+  const bloomBlur = makeFullscreenPass(`
+    varying vec2 vUv;
+    uniform sampler2D uTex;
+    uniform vec2 uDir;      // one texel along the axis being blurred
+    uniform float uRadius;
+    void main() {
+      // 9 taps, normalised Gaussian weights. Sampling on the half-texel
+      // between pairs would halve the tap count, but these levels are
+      // small enough that the plain version is cheap and it keeps the
+      // falloff honest at the wide radii the outer level uses.
+      float w0 = 0.2270270270;
+      float w1 = 0.1945945946;
+      float w2 = 0.1216216216;
+      float w3 = 0.0540540541;
+      float w4 = 0.0162162162;
+      vec2 d = uDir * uRadius;
+      vec3 acc = texture2D(uTex, vUv).rgb * w0;
+      acc += (texture2D(uTex, vUv + d) + texture2D(uTex, vUv - d)).rgb * w1;
+      acc += (texture2D(uTex, vUv + d * 2.0)
+            + texture2D(uTex, vUv - d * 2.0)).rgb * w2;
+      acc += (texture2D(uTex, vUv + d * 3.0)
+            + texture2D(uTex, vUv - d * 3.0)).rgb * w3;
+      acc += (texture2D(uTex, vUv + d * 4.0)
+            + texture2D(uTex, vUv - d * 4.0)).rgb * w4;
+      gl_FragColor = vec4(acc, 1.0);
+    }
+  `, {
+    uTex: { value: null },
+    uDir: { value: new THREE.Vector2(0, 0) },
+    uRadius: { value: 1.0 },
+  });
+
+  // Pass 3 - add the octaves back over the frame.
+  //
+  // Additive, not a mix: bloom is light ARRIVING on top of what is
+  // already there, and mixing would darken the very core it is supposed
+  // to be blowing out. The tint is warm because the glare in the
+  // reference is warm even where the thing glaring is white.
+  const bloomComposite = makeFullscreenPass(`
+    varying vec2 vUv;
+    uniform sampler2D uL0;
+    uniform sampler2D uL1;
+    uniform sampler2D uL2;
+    uniform vec3 uWeights;
+    uniform float uIntensity;
+    uniform vec3 uTint;
+    void main() {
+      vec3 c = texture2D(uL0, vUv).rgb * uWeights.x
+             + texture2D(uL1, vUv).rgb * uWeights.y
+             + texture2D(uL2, vUv).rgb * uWeights.z;
+      gl_FragColor = vec4(c * uIntensity * uTint, 1.0);
+    }
+  `, {
+    uL0: { value: bloomA[0].texture },
+    uL1: { value: bloomA[1].texture },
+    uL2: { value: bloomA[2].texture },
+    // Weighted toward the WIDE levels. Equal weights give a tight halo
+    // over a clean background, which is the opposite of the reference:
+    // what makes that frame read as a photograph is the broad veil, not
+    // the halo.
+    uWeights: { value: new THREE.Vector3(0.50, 0.88, 1.35) },
+    uIntensity: { value: 1.0 },
+    uTint: { value: new THREE.Color(1.0, 0.93, 0.80) },
+  });
+  bloomComposite.material.blending = THREE.AdditiveBlending;
+  bloomComposite.material.transparent = true;
+
+  // On top of the halving already built into the target sizes, so the
+  // outermost level reaches right across the frame.
+  const BLOOM_RADIUS = [1.0, 1.5, 2.2];
+
+  // Both driven by sliders, and both stored PER THEME - Great Sage keeps
+  // its own values even though it never renders any of this, because the
+  // theme store captures every control in the panel rather than a
+  // hand-maintained list.
+  let bloomStrength = 1.0;
+  let bloomRadiusMul = 1.0;
+  // Used by the glare layer further down; declared here so the slider
+  // bindings can all sit together.
+  let glareStrength = 1.0;
+
+  // Ping-pong per level. bloomA[i] always ends up holding the finished
+  // level, whichever physical target that turned out to be.
+  function blurInto(dst, srcTex, radius, dx, dy) {
+    bloomBlur.material.uniforms.uTex.value = srcTex;
+    bloomBlur.material.uniforms.uRadius.value = radius * bloomRadiusMul;
+    bloomBlur.material.uniforms.uDir.value.set(dx, dy);
+    renderer.setRenderTarget(dst);
+    renderer.clear();
+    renderer.render(bloomBlur.scene, warpCamera);
+  }
+
+  function renderBloom(sourceTexture) {
+    for (let i = 0; i < BLOOM_LEVELS; i++) {
+      let a = bloomA[i], b = bloomB[i];
+      if (i === 0) {
+        // Bright-pass straight off the model.
+        bloomBright.material.uniforms.uTex.value = sourceTexture;
+        renderer.setRenderTarget(a);
+        renderer.clear();
+        renderer.render(bloomBright.scene, warpCamera);
+      } else {
+        // Deeper levels downsample the finished level above, which is
+        // already thresholded and already blurred once.
+        blurInto(a, bloomA[i - 1].texture, BLOOM_RADIUS[i],
+                 1 / a.width, 0);
+      }
+      blurInto(b, a.texture, BLOOM_RADIUS[i], 1 / a.width, 0);
+      blurInto(a, b.texture, BLOOM_RADIUS[i], 0, 1 / a.height);
+    }
+    bloomComposite.material.uniforms.uL0.value = bloomA[0].texture;
+    bloomComposite.material.uniforms.uL1.value = bloomA[1].texture;
+    bloomComposite.material.uniforms.uL2.value = bloomA[2].texture;
+  }
 
   const GLOW_COLOR = 0xf2f8ff;
 
@@ -3432,7 +3643,13 @@ Hey Ciel</textarea>
     // instead of just adding to it - that's what was reading as "dark
     // lasers on top of the core."
     blending: THREE.AdditiveBlending,
-    uniforms: { uColor: { value: new THREE.Color(0xfff3d0) }, uTime: { value: 0 } },
+    // uSolid fades the sphere out for Raphael without hiding it - see
+    // the shine below for why it must stay raycastable.
+    uniforms: {
+      uColor: { value: new THREE.Color(0xfff3d0) },
+      uTime: { value: 0 },
+      uSolid: { value: 1.0 },
+    },
     vertexShader: `
       varying vec3 vNormal;
       varying vec3 vViewPosition;
@@ -3448,6 +3665,7 @@ Hey Ciel</textarea>
       varying vec3 vViewPosition;
       uniform vec3 uColor;
       uniform float uTime;
+      uniform float uSolid;
       float hash(vec3 p) {
         return fract(sin(dot(p, vec3(12.9898, 78.233, 45.164))) * 43758.5453);
       }
@@ -3458,7 +3676,7 @@ Hey Ciel</textarea>
         vec3 col = mix(uColor, vec3(1.0, 0.99, 0.95), fresnel * 0.85 + 0.15);
         col += grain;
         float alpha = mix(1.0, 0.0, pow(fresnel, 1.4));
-        gl_FragColor = vec4(col, alpha);
+        gl_FragColor = vec4(col, alpha * uSolid);
       }
     `
   });
@@ -3675,7 +3893,114 @@ Hey Ciel</textarea>
   });
   const lensFlare = new THREE.Sprite(lensFlareMat);
   lensFlare.scale.setScalar(5.5);
+  lensFlareMat.userData.baseOpacity = lensFlareMat.opacity;
   coreVisualsGroup.add(lensFlare);
+
+  // ---- Raphael's core: a shine, not a disc ----
+  // Krazaa: "the core looks more like a shine than a visible circle in
+  // the middle". Great Sage's core is a solid sphere with a hard rim, and
+  // no amount of glow around it stops the eye reading that rim - blooming
+  // it just makes a bigger hard-edged blob. So Raphael fades the sphere
+  // out (it stays present, invisibly, because the radial menu raycasts
+  // against it) and puts this in its place: a soft twelve-sided burn with
+  // a white-hot middle and fine streaks inside it, which is what the
+  // reference actually shows once you look past the glare.
+  //
+  // Parented into coreVisualsGroup so it inherits the core's scale
+  // slider and its idle breathing for free.
+  const coreShineMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 },
+      uInner: { value: new THREE.Color(1.0, 0.99, 0.95) },
+      uOuter: { value: new THREE.Color(1.0, 0.72, 0.24) },
+      uStrength: { value: 1.0 },
+      uSides: { value: 12.0 },
+    },
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      varying vec2 vUv;
+      uniform float uTime;
+      uniform vec3 uInner;
+      uniform vec3 uOuter;
+      uniform float uStrength;
+      uniform float uSides;
+
+      float hash(float n) { return fract(sin(n * 12.9898) * 43758.5453); }
+
+      void main() {
+        vec2 p = vUv - 0.5;
+        float r = length(p) * 2.0;          // 1.0 at the plane's edge
+        float a = atan(p.y, p.x);
+
+        // Regular-polygon radius at this angle, so rr = 1 sits exactly on
+        // the twelve-sided boundary and everything below works in
+        // "fraction of the way to the edge" regardless of direction.
+        // Not called half - that is a reserved word in GLSL ES and the
+        // shader would simply fail to compile on the drivers that
+        // enforce it, taking the core with it.
+        float wedge = 3.14159265 / uSides;
+        float poly = cos(wedge) / cos(mod(a + wedge, 2.0 * wedge) - wedge);
+        float rr = r / max(poly, 0.0001);
+
+        // A plateau, not a peak: flat across the middle and falling
+        // only near the twelve-sided boundary. This is what makes the
+        // core read as a broad burn rather than as a spark.
+        float body = smoothstep(1.02, 0.32, rr);
+
+        // Mottling inside the burn. A filled shape with no structure in
+        // it comes back from the bloom stage as a flat white disc - the
+        // reference core is full of uneven light, and this is the
+        // cheapest thing that reads that way.
+        float mott = 0.70 + 0.30 * sin(a * 9.0 + rr * 21.0 + uTime * 0.14)
+                                 * sin(rr * 33.0 - uTime * 0.19);
+        // White-hot middle, small and very bright. Small matters: with
+        // the bloom stage behind it, anything broad here comes back as a
+        // white lozenge with no shape left in it at all.
+        // Wider than a pinpoint: the reference's white centre eases out
+        // into the gold body rather than sitting on it as a spark.
+        float hot = pow(max(0.0, 1.0 - rr), 7.0) * 1.10;
+
+        // Streaks inside the burn. In the reference the core is not flat
+        // light - it has a fine radial grain running out from the middle,
+        // like a struck match seen through a lens.
+        float k = fract(a / 6.2831853 + 0.5 + uTime * 0.006);
+        float idx = floor(k * 96.0);
+        float f = fract(k * 96.0) - 0.5;
+        float h = hash(idx);
+        float streak = smoothstep(mix(0.03, 0.20, h), 0.0, abs(f))
+                     * pow(max(0.0, 1.0 - rr), 1.4)
+                     * (0.30 + 0.70 * hash(idx + 5.0));
+
+        // Right at rr = 1, so it traces the twelve-sided boundary.
+        float rim = smoothstep(0.86, 0.99, rr) * smoothstep(1.10, 1.00, rr);
+
+        // The body carries the core, not the hot centre. At 0.52 the
+        // filled area sat DIMMER than the script around it and read as
+        // haze; in the reference the burn is the brightest thing in
+        // frame by a clear margin.
+        float v = (body * 0.90 * mott + streak * 0.50 + hot
+                   + rim * 0.55) * uStrength;
+        vec3 col = mix(uOuter, uInner, clamp(hot + streak * 0.3, 0.0, 1.0));
+        gl_FragColor = vec4(col * v, v);
+      }
+    `,
+  });
+  // Sized in the core's own units: coreSphere is radius 0.7, and the
+  // reference core reads far broader than that against the script.
+  const coreShine = new THREE.Mesh(
+    new THREE.PlaneGeometry(6.6, 6.6), coreShineMat);
+  coreShine.renderOrder = 4;
+  coreShine.visible = false;          // Great Sage is the default
+  coreVisualsGroup.add(coreShine);
 
   // ---------- Ring fringe texture (fakes chromatic-aberration edges) ----------
   const fringeTex = (function () {
@@ -4176,17 +4501,57 @@ Hey Ciel</textarea>
       const h = bandH * (0.42 + rnd * 0.26);
       const w = bandH * (0.16 + rnd2 * 0.16);
 
+      // A third hash, so the ornaments are not correlated with the
+      // stem's own shape - two hashes made every curved glyph also carry
+      // the same hook, and the band read as one letter repeated.
+      const seed3 = Math.sin(i * 41.377) * 24634.1234;
+      const rnd3 = seed3 - Math.floor(seed3);
+
+      // The stem, bowed more often than not.
       g.beginPath();
       g.moveTo(0, -h / 2);
-      g.lineTo(0, h / 2);                       // the stem
-      // Hooks and bars hung off it - enough variety that the eye reads
-      // letterforms rather than tally marks.
-      if (rnd > 0.30) { g.moveTo(0, -h / 2); g.lineTo(w, -h / 2 + w * 0.7); }
-      if (rnd > 0.62) { g.moveTo(0, h / 2); g.lineTo(-w, h / 2 - w * 0.7); }
-      if (rnd2 > 0.45) { g.moveTo(-w * 0.8, 0); g.lineTo(w * 0.8, 0); }
-      if (rnd2 > 0.78) { g.moveTo(-w * 0.6, -h * 0.22); g.lineTo(w * 0.6, -h * 0.22); }
+      if (rnd < 0.62) {
+        g.quadraticCurveTo((rnd2 - 0.5) * w * 2.2, 0, 0, h / 2);
+      } else {
+        g.lineTo(0, h / 2);
+      }
       g.stroke();
-      if (rnd > 0.85) {
+
+      // A shoulder curling off the top - the commonest thing in the
+      // reference script, and what most makes it read as cursive.
+      if (rnd > 0.22) {
+        g.beginPath();
+        g.moveTo(0, -h / 2);
+        g.quadraticCurveTo(w * 1.15, -h / 2, w * (0.55 + rnd3 * 0.5),
+                           -h * (0.20 + rnd3 * 0.14));
+        g.stroke();
+      }
+      // A tail curling off the bottom, usually the other way.
+      if (rnd2 > 0.34) {
+        g.beginPath();
+        g.moveTo(0, h / 2);
+        g.quadraticCurveTo(-w * 1.05, h / 2, -w * (0.45 + rnd * 0.45),
+                           h * (0.16 + rnd * 0.16));
+        g.stroke();
+      }
+      // A closed loop on the stem. Sparse on purpose: on every glyph it
+      // stops being an ornament and becomes a pattern.
+      if (rnd3 > 0.66) {
+        const ly = h * (rnd2 - 0.5) * 0.5;
+        g.beginPath();
+        g.ellipse(w * 0.30, ly, w * 0.34, h * 0.10,
+                  (rnd - 0.5) * 1.2, 0, Math.PI * 2);
+        g.stroke();
+      }
+      // Crossbars stay straight - the contrast is what makes the curves
+      // read as curves.
+      if (rnd2 > 0.62) {
+        g.beginPath();
+        g.moveTo(-w * 0.75, h * (rnd3 - 0.5) * 0.55);
+        g.lineTo(w * 0.75, h * (rnd3 - 0.5) * 0.55);
+        g.stroke();
+      }
+      if (rnd > 0.86) {
         g.beginPath();
         g.arc(w * 0.5, h * 0.30, weight * 0.9, 0, Math.PI * 2);
         g.fill();
@@ -4279,21 +4644,31 @@ Hey Ciel</textarea>
   const bokehGroup = new THREE.Group();
   raphaelGroup.add(bokehGroup);
   const bokehLights = [];
-  for (let i = 0; i < 110; i++) {
+  for (let i = 0; i < 170; i++) {
+    // A wide spread of sizes, biased small: the reference has a few
+    // large defocused discs among many small ones, not a uniform field.
+    const scale = 0.28 + Math.pow(Math.random(), 2.0) * 1.25;
+    // Dimmer the bigger they are. The same light spread over four times
+    // the area is four times fainter, and without this the largest ones
+    // came out as hard bright discs at the edge of frame - lamps, not
+    // something out of focus.
+    const spread = (scale - 0.28) / 1.25;
     const mat = new THREE.SpriteMaterial({
       map: bokehTex,
       transparent: true,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
-      opacity: 0.16 + Math.random() * 0.42,
-      color: new THREE.Color(0xffd98a),
+      // Additive light laid over a bright gold field barely registers
+      // below about a third opacity - these used to top out at 0.58 and
+      // read as three faint specks.
+      opacity: (0.28 + Math.random() * 0.42) * (1.0 - spread * 0.55),
+      color: new THREE.Color(0xffeaba),
     });
     const sp = new THREE.Sprite(mat);
     // Spread through the whole annulus between the two circles of script,
     // which is the gap the reference fills.
-    const radius = 2.6 + Math.random() * 14.5;
+    const radius = 2.2 + Math.random() * 15.0;
     const angle = Math.random() * Math.PI * 2;
-    const scale = 0.30 + Math.random() * 1.5;
     sp.scale.setScalar(scale);
     sp.position.set(Math.cos(angle) * radius, Math.sin(angle) * radius,
                     -0.6 + Math.random() * 1.0);
@@ -4321,7 +4696,7 @@ Hey Ciel</textarea>
     uniforms: {
       uTime: { value: 0 },
       uColor: { value: new THREE.Color(0xffd070) },
-      uStrength: { value: 0.5 },
+      uStrength: { value: 0.52 },
       // World radii, from RUNE_SPEC. The water starts where the inner
       // ring ends, stops where the border ring begins, and is cut away
       // over the middle ring - so it only ever runs in the gaps BETWEEN
@@ -4369,9 +4744,10 @@ Hey Ciel</textarea>
         // Three ripple trains at different speeds and wavelengths. One
         // alone reads as a target; three interfering read as a surface.
         float w = sin(r * 46.0 - uTime * 1.5)
-                + sin(r * 27.0 - uTime * 0.9 + a * 2.0) * 0.7
-                + sin(r * 71.0 - uTime * 2.2 - a * 3.0) * 0.4;
-        w = w * 0.5 + 0.5;
+                + sin(r * 27.0 - uTime * 0.9 + a * 5.0) * 0.62
+                + sin(r * 71.0 - uTime * 2.2 - a * 8.0) * 0.40
+                + sin(r * 17.0 + uTime * 0.6 + a * 13.0) * 0.30;
+        w = w * 0.42 + 0.5;
 
         // Only in the gaps. r is in UV, so scale it back to the world
         // units the ring radii are expressed in before comparing.
@@ -4389,6 +4765,165 @@ Hey Ciel</textarea>
     new THREE.PlaneGeometry(RIPPLE_SHEET_SIZE, RIPPLE_SHEET_SIZE), rippleMat);
   rippleSheet.position.z = -0.5;
   raphaelGroup.add(rippleSheet);
+
+  // ---- Veiling glare ----
+  // Deliberately NOT a plain radial gradient. A clean gradient reads as
+  // a vignette - as something done to the picture - where real veiling
+  // glare is lumpy and slightly off-centre, because it comes from light
+  // scattering off imperfections rather than from the middle of frame.
+  // Hence the two slow sine terms, which are enough to break the
+  // symmetry without ever being legible as waves.
+  const hazeMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 },
+      uColor: { value: new THREE.Color(1.0, 0.80, 0.46) },
+      uStrength: { value: 1.0 },
+    },
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
+    blending: THREE.AdditiveBlending,
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      varying vec2 vUv;
+      uniform float uTime;
+      uniform vec3 uColor;
+      uniform float uStrength;
+      void main() {
+        vec2 p = vUv - 0.5;
+        float r = length(p) * 2.0;
+        float a = atan(p.y, p.x);
+
+        // A broad plateau rather than a peak. Brightest across the middle
+        // distance - the ring that was empty - and still present out at
+        // the corners, which is what lifts the blacks.
+        float wide = smoothstep(1.05, 0.12, r);
+        // Full across the ring that was empty (about r = 0.08 to 0.20)
+        // and easing off inside that, so the veil fills the gap without
+        // stacking onto the core, which needs no help being bright.
+        float mid = smoothstep(0.58, 0.10, r) * smoothstep(0.02, 0.09, r);
+
+        float lump = 0.80
+                   + 0.13 * sin(a * 2.0 + uTime * 0.05)
+                   + 0.07 * sin(a * 5.0 - uTime * 0.03 + r * 4.0);
+
+        float v = (wide * 0.20 + mid * 0.24) * lump * uStrength;
+        gl_FragColor = vec4(uColor * v, v);
+      }
+    `,
+  });
+  const hazeSheet = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), hazeMat);
+  // Behind the script and the glare, in front of the background wash.
+  hazeSheet.position.z = -0.45;
+  hazeSheet.renderOrder = -1;
+  raphaelGroup.add(hazeSheet);
+
+  // ---- The glare fan ----
+  // The spikes thrown off the core in every reference frame. They are
+  // NOT the lasers - those are Great Sage's, they have real geometry and
+  // Krazaa asked for them to stay. These are the lens artefact around
+  // them: dozens of them, hair-fine, uneven in length and brightness,
+  // running out over the script and off the edge of frame.
+  //
+  // Drawn as one shader on one plane rather than as N line meshes. Sixty
+  // separate objects would each cost a draw call to produce something
+  // that is, in the end, a function of angle - and a line mesh cannot
+  // taper or soften along its length, which is the entire look.
+  const GLARE_PLANE = 46;
+  const glareMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 },
+      uColor: { value: new THREE.Color(1.0, 0.95, 0.84) },
+      uStrength: { value: 1.0 },
+    },
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
+    blending: THREE.AdditiveBlending,
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      varying vec2 vUv;
+      uniform float uTime;
+      uniform vec3 uColor;
+      uniform float uStrength;
+
+      float hash(float n) { return fract(sin(n * 12.9898) * 43758.5453); }
+
+      void main() {
+        vec2 p = vUv - 0.5;
+        float r = length(p);
+        float a = atan(p.y, p.x);
+
+        // Angle as 0..1, turning very slowly. Slow enough that it is
+        // never caught moving; fast enough that the pattern is not a
+        // decal frozen onto the screen.
+        float k = fract(a / 6.2831853 + 0.5 + uTime * 0.004);
+
+        // Fixed count, but the position, width, length and brightness of
+        // every spike are hashed off its index - evenly spaced spikes of
+        // equal length read as a diagram of a sun, not as glare.
+        const float N = 64.0;
+        float idx = floor(k * N);
+        float f = fract(k * N) - 0.5;
+
+        float h1 = hash(idx);
+        float h2 = hash(idx + 31.7);
+        float h3 = hash(idx + 71.3);
+        float h4 = hash(idx + 13.1);
+
+        // Jittered off the centre of its slot, so the fan is uneven.
+        float d = abs(f - (h1 - 0.5) * 0.72);
+        // Hair-fine. Anything wider stops reading as light and starts
+        // reading as a drawn triangle.
+        float w = mix(0.010, 0.055, h2 * h2);
+        float spike = smoothstep(w, 0.0, d);
+
+        // Each spike dies at its own distance. A few reach the corners;
+        // most give out well before that.
+        float reach = mix(0.10, 0.62, h3 * h3);
+        float fall = exp(-r / reach);
+
+        // Hollow at the very centre, or 64 spikes overlapping at the
+        // origin would just paint a disc there.
+        float inner = smoothstep(0.008, 0.055, r);
+
+        // Slow independent twinkle per spike.
+        float tw = 0.62 + 0.38 * sin(uTime * (0.5 + h4) + h1 * 24.0);
+
+        float acc = spike * fall * inner * tw * mix(0.35, 1.0, h4);
+
+        // The cross flare. Every reference frame has one bright
+        // horizontal and one bright vertical bar through the core, much
+        // brighter and much shorter than the fan around them - the
+        // signature of the light itself rather than of the aperture.
+        float bx = exp(-abs(p.y) * 620.0) * exp(-r * 26.0);
+        float by = exp(-abs(p.x) * 780.0) * exp(-r * 31.0);
+        acc += (bx * 0.42 + by * 0.32) * inner;
+
+        float v = acc * uStrength;
+        gl_FragColor = vec4(uColor * v, v);
+      }
+    `,
+  });
+  const glareSheet = new THREE.Mesh(
+    new THREE.PlaneGeometry(GLARE_PLANE, GLARE_PLANE), glareMat);
+  // In FRONT of the script. In the reference the spikes cross over the
+  // writing rather than passing behind it.
+  glareSheet.position.z = 0.6;
+  glareSheet.renderOrder = 5;
+  raphaelGroup.add(glareSheet);
 
   // Resolved when it is called, NOT built here. starField is declared
   // several hundred lines further down this same scope, so naming it in
@@ -4424,6 +4959,16 @@ Hey Ciel</textarea>
     // beam - the core is a star, not a projector.
     const pole = document.getElementById('core-pole');
     if (pole) pole.style.display = raphael ? 'none' : '';
+    // The shine replaces the sphere rather than joining it. Left at full
+    // strength together they read as a hard disc inside a soft one.
+    coreShine.visible = raphael;
+    coreSphereMat.uniforms.uSolid.value = raphael ? 0.10 : 1.0;
+    // Great Sage's star-flare sprite draws one hard vertical bar through
+    // the core. Against Raphael's soft burn it reads as a drawn line
+    // over a photograph, and the glare shader already provides the
+    // cross the reference actually has.
+    lensFlareMat.opacity = (lensFlareMat.userData.baseOpacity || 1)
+      * (raphael ? 0.14 : 1.0);
     greatSageOnly().forEach(function (o) { if (o) o.visible = !raphael; });
     // Loose arrays rather than groups, so they are switched here instead
     // of in the list above.
@@ -6936,6 +7481,10 @@ const MINI_CHAT_PAD = 3;
       runeInner.rotation.z += 0.0016 * frameScale;
       runeOuter.rotation.z -= 0.0011 * frameScale;
       runeBorder.rotation.z += 0.0004 * frameScale;
+      glareMat.uniforms.uStrength.value = glareStrength;
+      glareMat.uniforms.uTime.value = t;
+      hazeMat.uniforms.uTime.value = t;
+      coreShineMat.uniforms.uTime.value = t;
       rippleMat.uniforms.uTime.value = t * 6.0;
       // The lights circle rather than sit still, each at its own rate,
       // breathing slightly so the field never looks frozen.
@@ -7088,7 +7637,8 @@ const MINI_CHAT_PAD = 3;
 
     coreGlow.scale.setScalar(6.5 + listenPulse * 2.2);
     coreSphereMat.uniforms.uTime.value = t * 10;
-    coreGlow.material.opacity = Math.min(1, 0.95 + listenPulse * 0.05);
+    coreGlow.material.opacity = Math.min(1, 0.95 + listenPulse * 0.05)
+      * (raphaelActive() ? 0.52 : 1.0);
     // Full opacity (was 0.85) - now that the wireframe is sized
     // independently of the (smaller) core, more of the cage sits in dark
     // background rather than bathed in the core's glow, so its own dim
@@ -7210,7 +7760,7 @@ const MINI_CHAT_PAD = 3;
     });
 
     // Nebula wash slowly breathes on its own, no amplitude tie-in
-    nebulaMat.opacity = 0.6;
+    nebulaMat.opacity = raphaelActive() ? 0.34 : 0.6;
     nebula.rotation.z += 0.0004;
 
     // Shards drift and spin independently - constant brightness
@@ -7400,13 +7950,31 @@ const MINI_CHAT_PAD = 3;
     // steady lens-style chromatic-aberration look. Its actual on-screen
     // strength still isn't uniform: cornerVignetteMask() in the shader
     // scales it up toward the edges/corners and down to ~0 at center.
+    // Pass 2b: bloom, taken off the model target before anything
+    // reaches the screen. Raphael only - see makeFullscreenPass.
+    const bloomOn = raphaelActive() && bloomStrength > 0.001;
+    if (bloomOn) renderBloom(fgTarget.texture);
+
     renderer.setRenderTarget(null);
     renderer.setClearColor(0x000000, 1);
     renderer.clear();
     bgComposite.material.uniforms.uRgbOffset.value.set(0.009, 0.0036);
+    if (raphaelActive()) {
+      bgComposite.material.uniforms.uGain.value = 1.55;
+      bgComposite.material.uniforms.uLift.value.set(0.20, 0.135, 0.055);
+    } else {
+      bgComposite.material.uniforms.uGain.value = 1.0;
+      bgComposite.material.uniforms.uLift.value.set(0, 0, 0);
+    }
     // fgComposite's offset stays at (0,0) - see note above, never touched here.
     renderer.render(bgComposite.scene, warpCamera);
     renderer.render(fgComposite.scene, warpCamera);
+    // Last, and additive, so the glare lies OVER the finished frame the
+    // way it lies over a photograph rather than being part of the image.
+    if (bloomOn) {
+      bloomComposite.material.uniforms.uIntensity.value = bloomStrength;
+      renderer.render(bloomComposite.scene, warpCamera);
+    }
 
   }
 
@@ -8705,15 +9273,16 @@ const MINI_CHAT_PAD = 3;
       // with a teal scene - but the frame is overwhelmingly gold, and
       // the fringe is chromatic spill at the edges, not the field.
       'theme-color-picker': '#fff0c4',
-      'bg-accent-color-picker': '#ffbf3a',
-      'bg-base-color-picker': '#7a4a08',
+      'bg-accent-color-picker': '#ffd98f',
+      'bg-base-color-picker': '#6a4a2a',
+      'theme-color-picker': '#ffc766',
       // A star, not a spark. The reference core is a broad white-gold
       // burn with the glare thrown off it, so the core carries far more
       // of the frame than Great Sage's tight point does.
       'core-scale-slider': '155',
       'speaking-glow-slider': '340',
       // The spears of light.
-      'laser-opacity-slider': '170',
+      'laser-opacity-slider': '105',
       'rings-slider': '150',
       // Blown out and smeared - the reference is drowning in bloom and
       // chromatic spill.
@@ -8727,6 +9296,12 @@ const MINI_CHAT_PAD = 3;
       'outer-ring-scale-slider': '100',
       // The upgrade Krazaa named: eight sides become twelve.
       'octagon-sides-slider': '12',
+      // Drowning in light. The reference has no clean edges anywhere -
+      // the core is past white, the script glows, and the whole frame
+      // sits in a haze - so this runs well above the nominal 100.
+      'bloom-slider': '105',
+      'bloom-spread-slider': '165',
+      'glare-slider': '140',
     },
   };
 
@@ -8739,11 +9314,21 @@ const MINI_CHAT_PAD = 3;
   // ui". So it stays global: the same whichever theme is on.
   const THEME_EXCLUDE = { 'panel-darkness-slider': true };
 
+  // Voice FX are not a look. Every fx- control - the EQ, the reverb, the
+  // flanger, the voice gain - lives inside a .settings-group like the
+  // visual sliders do, so the theme was capturing all of them and
+  // switching theme quietly rewrote how Great Sage SOUNDS. Krazaa's line
+  // was "only changing how the home visuals look and the overlay, not
+  // the ui or anything else", and a voice is very much anything else.
+  function isThemedControl(el) {
+    return !!el.id && !THEME_EXCLUDE[el.id] && el.id.indexOf('fx-') !== 0;
+  }
+
   function themedControls() {
     if (!settingsSection) return [];
     return Array.prototype.slice.call(
       settingsSection.querySelectorAll('.settings-group input'))
-      .filter(function (el) { return !!el.id && !THEME_EXCLUDE[el.id]; });
+      .filter(isThemedControl);
   }
 
   function captureTheme() {
@@ -8831,6 +9416,7 @@ const MINI_CHAT_PAD = 3;
   }
   function applySettings(saved) {
     if (!saved || typeof saved !== 'object') return;
+    let pendingThemeValues = null;
     if (typeof saved['themes'] === 'string') {
       try {
         const t = JSON.parse(saved['themes']);
@@ -8838,14 +9424,25 @@ const MINI_CHAT_PAD = 3;
       } catch (err) { /* a corrupt blob must not stop the rest loading */ }
     }
     if (typeof saved['active-theme'] === 'string' && saved['active-theme']) {
-      // Only the record of which theme is on. The values themselves were
-      // already applied by the generic scan below, because the flat
-      // settings ARE the active theme - re-applying here would fight it.
       activeTheme = saved['active-theme'];
       if (themeSelect) themeSelect.value = activeTheme;
       // Restoring a saved theme has to bring its objects back too, not
       // just its slider values.
       if (window.__applyThemeScene) window.__applyThemeScene(activeTheme);
+      // The theme store is the authority, applied AFTER the generic scan
+      // below rather than instead of it.
+      //
+      // This used to assume "the flat settings ARE the active theme, so
+      // re-applying here would fight it". They are the same thing only
+      // while nothing has gone wrong. When the two disagree - and a
+      // script that died during init guarantees they will, because the
+      // flat values are then whatever was last written while some other
+      // theme was on screen - the flat values won, and the very next
+      // save wrote them straight back over the active theme's entry.
+      // That is how Raphael ended up stored with Great Sage's numbers:
+      // an eight-sided ring and a purple sky.
+      pendingThemeValues = themeStore[activeTheme]
+        || THEME_SEEDS[activeTheme] || null;
     }
     if (typeof saved['sfx-gains'] === 'string') {
       try {
@@ -8876,6 +9473,9 @@ const MINI_CHAT_PAD = 3;
       const pttBtn = document.getElementById('ptt-rebind-btn');
       if (pttBtn) { pttBtn.dataset.combo = saved['ptt-combo']; pttBtn.textContent = comboLabel(saved['ptt-combo']); }
     }
+    // Last word, over the generic scan above: whatever the flat values
+    // happened to be, the controls end up holding the active theme's.
+    if (pendingThemeValues) applyThemeValues(pendingThemeValues);
     applyCaptionPosition(saved['caption-pos']);
   }
   let saveSettingsTimer = null;
@@ -9033,6 +9633,18 @@ const MINI_CHAT_PAD = 3;
   document.getElementById('chroma-slider').addEventListener('input', (e) => {
     bgComposite.material.uniforms.uChroma.value = Number(e.target.value) / 100;
   });
+  // These three do nothing on Great Sage by design - the whole bloom
+  // stage is skipped unless Raphael is active - so they are safe to
+  // leave live rather than showing and hiding the group per theme.
+  document.getElementById('bloom-slider').addEventListener('input', (e) => {
+    bloomStrength = Number(e.target.value) / 100;
+  });
+  document.getElementById('bloom-spread-slider').addEventListener('input', (e) => {
+    bloomRadiusMul = Number(e.target.value) / 100;
+  });
+  document.getElementById('glare-slider').addEventListener('input', (e) => {
+    glareStrength = Number(e.target.value) / 100;
+  });
   document.getElementById('panel-darkness-slider').addEventListener('input', (e) => {
     // Plain CSS variable rather than touching the rule directly, so the
     // panel's own stylesheet stays the single source of truth for how
@@ -9091,6 +9703,9 @@ const MINI_CHAT_PAD = 3;
   addResetOnDoubleClick(document.getElementById('magic-circle-opacity-slider'), 15);
   addResetOnDoubleClick(document.getElementById('laser-opacity-slider'), 55);
   addResetOnDoubleClick(document.getElementById('chroma-slider'), 100);
+  addResetOnDoubleClick(document.getElementById('bloom-slider'), 100);
+  addResetOnDoubleClick(document.getElementById('bloom-spread-slider'), 100);
+  addResetOnDoubleClick(document.getElementById('glare-slider'), 100);
   addResetOnDoubleClick(document.getElementById('panel-darkness-slider'), 60);
   addResetOnDoubleClick(document.getElementById('speaking-pulse-slider'), 100);
   addResetOnDoubleClick(document.getElementById('speaking-glow-slider'), 200);
