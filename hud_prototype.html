@@ -2022,6 +2022,8 @@ body.mini:hover #mini-exit { opacity: 1; }
           <input type="range" id="bloom-spread-slider" min="40" max="260" value="100">
           <label class="slider-label">Glare rays</label>
           <input type="range" id="glare-slider" min="0" max="300" value="100">
+          <label class="slider-label">Water</label>
+          <input type="range" id="water-slider" min="0" max="300" value="100">
         </details>
 
         <details class="settings-group">
@@ -2535,6 +2537,8 @@ Hey Ciel</textarea>
         uniform float uChroma;  // chromatic aberration intensity (0 = off)
         uniform float uGain;    // exposure on this pass (1 = untouched)
         uniform vec3 uLift;     // black level (0 = untouched)
+        uniform float uWater;   // surface refraction (0 = untouched)
+        uniform float uWaterT;
 
         // Rough spectral ramp, red through green to blue. Used to tint
         // each tap of the smear below so the fringe comes out as layered
@@ -2649,6 +2653,18 @@ Hey Ciel</textarea>
           // identical to vUv, so the middle is untouched by construction.
           vec2 uv = fisheyeDistort(vUv, uFisheye, mask);
 
+          // Looking UP at a water surface: the image behind it arrives
+          // displaced, and the displacement travels. Two frequencies per
+          // axis so the motion never resolves into one visible wave.
+          if (uWater > 0.0001) {
+            uv += vec2(
+              sin(uv.y * 11.0 + uWaterT * 0.55)
+                + 0.55 * sin(uv.y * 23.0 - uWaterT * 0.31),
+              cos(uv.x * 13.0 - uWaterT * 0.47)
+                + 0.55 * cos(uv.x * 27.0 + uWaterT * 0.29)
+            ) * uWater;
+          }
+
           // Same mask as the fisheye above - zero across the middle,
           // strongest at the corners - like the colour separation a real
           // lens shows where it bends light hardest, not a screen glitch.
@@ -2711,6 +2727,8 @@ Hey Ciel</textarea>
       uChroma: { value: 1.0 }, // "Colour fringing" slider in settings
       uGain: { value: 1.0 },
       uLift: { value: new THREE.Vector3(0, 0, 0) },
+      uWater: { value: 0.0 },
+      uWaterT: { value: 0.0 },
     },
     false
   );
@@ -2746,6 +2764,8 @@ Hey Ciel</textarea>
       // MUST be here even though they are the identity. See above.
       uGain: { value: 1.0 },
       uLift: { value: new THREE.Vector3(0, 0, 0) },
+      uWater: { value: 0.0 },
+      uWaterT: { value: 0.0 },
     },
     true
   );
@@ -2899,6 +2919,9 @@ Hey Ciel</textarea>
   // hand-maintained list.
   let bloomStrength = 1.0;
   let bloomRadiusMul = 1.0;
+  // Drives all three water layers together - the surface refraction in
+  // the composite, the caustics, and the ripples in the gaps.
+  let waterStrength = 1.0;
   // Used by the glare layer further down; declared here so the slider
   // bindings can all sit together.
   let glareStrength = 1.0;
@@ -3987,7 +4010,7 @@ Hey Ciel</textarea>
         // filled area sat DIMMER than the script around it and read as
         // haze; in the reference the burn is the brightest thing in
         // frame by a clear margin.
-        float v = (body * 0.90 * mott + streak * 0.50 + hot
+        float v = (body * 0.68 * mott + streak * 0.44 + hot
                    + rim * 0.55) * uStrength;
         vec3 col = mix(uOuter, uInner, clamp(hot + streak * 0.3, 0.0, 1.0));
         gl_FragColor = vec4(col * v, v);
@@ -4218,6 +4241,7 @@ Hey Ciel</textarea>
   const octagonUniforms = {
     uInnerR: { value: 1.2 },
     uOuterR: { value: 1.22 },
+    uSoft: { value: 0.0 },
     uStretchX: { value: 1.0 },
     uStretchY: { value: 1.0 },
     uColor: { value: new THREE.Color(0xfff8ea) },
@@ -4248,6 +4272,7 @@ Hey Ciel</textarea>
       varying vec2 vPos;
       uniform float uInnerR;
       uniform float uOuterR;
+      uniform float uSoft;    // 0 = the original hard band
       uniform float uStretchX;
       uniform float uStretchY;
       uniform vec3 uColor;
@@ -4298,6 +4323,22 @@ Hey Ciel</textarea>
 
       void main() {
         float d = octagonDist(vPos, vec2(uStretchX, uStretchY));
+
+        // Raphael's path. A gaussian band centred on the ring rather
+        // than two hard edges either side of it - the reference's ring
+        // has no edge at all, it is a bright soft rim of the kind a lens
+        // throws around a light. Great Sage never enters here: uSoft is
+        // 0 for it, and the arithmetic below is untouched.
+        if (uSoft > 0.0001) {
+          float mid = (uInnerR + uOuterR) * 0.5;
+          float t = (d - mid) / uSoft;
+          float g = exp(-t * t);
+          if (g < 0.004) discard;
+          vec3 sc = uColor * (1.0 + uAmplitude * 1.4);
+          gl_FragColor = vec4(sc * g, g * 0.95);
+          return;
+        }
+
         float outerEdge = smoothstep(uOuterR, uOuterR - 0.006, d);
         float innerHole = smoothstep(uInnerR - 0.006, uInnerR, d);
         float fill = outerEdge * innerHole;
@@ -4472,6 +4513,10 @@ Hey Ciel</textarea>
     const bandH = size * (outerFrac - innerFrac);
 
     g.strokeStyle = 'rgba(255,255,255,0.95)';
+    // Never leave this to the default. See the note above: an unset
+    // fillStyle here paints opaque black, which survives additive
+    // blending as an alpha hole and reads as a black dot on screen.
+    g.fillStyle = 'rgba(255,255,255,0.95)';
     g.lineCap = 'round';
     g.lineJoin = 'round';
 
@@ -4766,6 +4811,66 @@ Hey Ciel</textarea>
   rippleSheet.position.z = -0.5;
   raphaelGroup.add(rippleSheet);
 
+  // ---- Caustics ----
+  // The moving net of light a wavy surface focuses onto what is beneath
+  // it. Four layers, each the previous one rotated and scaled, so the
+  // pattern never repeats visibly; abs() folds each wave into a crease
+  // and the power sharpens the crease into a line. Sines on their own
+  // give soft blobs, which is not what water does.
+  const causticMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uTime: { value: 0 },
+      uColor: { value: new THREE.Color(1.0, 0.93, 0.74) },
+      uStrength: { value: 1.0 },
+    },
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
+    blending: THREE.AdditiveBlending,
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      varying vec2 vUv;
+      uniform float uTime;
+      uniform vec3 uColor;
+      uniform float uStrength;
+
+      void main() {
+        vec2 p = (vUv - 0.5) * 9.0;
+        float t = uTime * 0.35;
+
+        float acc = 0.0;
+        vec2 q = p;
+        for (int i = 0; i < 4; i++) {
+          // Rotate and scale between layers. Column-major in GLSL, so
+          // this is the usual 2D rotation by about 37 degrees.
+          q = mat2(0.80, 0.60, -0.60, 0.80) * q * 1.32 + vec2(1.7, -0.9);
+          float v = sin(q.x + t * 0.62) + sin(q.y - t * 0.47);
+          acc += pow(max(0.0, 1.0 - abs(v) * 0.62), 4.0);
+        }
+        acc *= 0.22;
+
+        // Off over the core - the burn is not underwater, and caustics
+        // crawling across it just muddy it - and easing back in outward.
+        float r = length(vUv - 0.5) * 2.0;
+        acc *= smoothstep(0.06, 0.24, r);
+
+        float v = acc * uStrength;
+        gl_FragColor = vec4(uColor * v, v);
+      }
+    `,
+  });
+  const causticSheet = new THREE.Mesh(
+    new THREE.PlaneGeometry(44, 44), causticMat);
+  causticSheet.position.z = -0.55;   // under the haze and the water
+  causticSheet.renderOrder = -2;
+  raphaelGroup.add(causticSheet);
+
   // ---- Veiling glare ----
   // Deliberately NOT a plain radial gradient. A clean gradient reads as
   // a vignette - as something done to the picture - where real veiling
@@ -4813,7 +4918,7 @@ Hey Ciel</textarea>
                    + 0.13 * sin(a * 2.0 + uTime * 0.05)
                    + 0.07 * sin(a * 5.0 - uTime * 0.03 + r * 4.0);
 
-        float v = (wide * 0.20 + mid * 0.24) * lump * uStrength;
+        float v = (wide * 0.15 + mid * 0.22) * lump * uStrength;
         gl_FragColor = vec4(uColor * v, v);
       }
     `,
@@ -4963,6 +5068,9 @@ Hey Ciel</textarea>
     // strength together they read as a hard disc inside a soft one.
     coreShine.visible = raphael;
     coreSphereMat.uniforms.uSolid.value = raphael ? 0.10 : 1.0;
+    // In plane-distance units, so at the 3x scale Raphael runs the ring
+    // at this reads as a soft rim about half a world unit thick.
+    octagonMat.uniforms.uSoft.value = raphael ? 0.13 : 0.0;
     // Great Sage's star-flare sprite draws one hard vertical bar through
     // the core. Against Raphael's soft burn it reads as a drawn line
     // over a photograph, and the glare shader already provides the
@@ -7484,6 +7592,9 @@ const MINI_CHAT_PAD = 3;
       glareMat.uniforms.uStrength.value = glareStrength;
       glareMat.uniforms.uTime.value = t;
       hazeMat.uniforms.uTime.value = t;
+      causticMat.uniforms.uTime.value = t;
+      causticMat.uniforms.uStrength.value = 0.55 * waterStrength;
+      rippleMat.uniforms.uStrength.value = 0.52 * waterStrength;
       coreShineMat.uniforms.uTime.value = t;
       rippleMat.uniforms.uTime.value = t * 6.0;
       // The lights circle rather than sit still, each at its own rate,
@@ -7630,9 +7741,11 @@ const MINI_CHAT_PAD = 3;
     // further out) but stays much fainter throughout - together reading
     // as a soft pulse rather than a hard size jump.
     octagonGlow.scale.setScalar(2.6 + amplitude * 2.6 * speakingGlowIntensity);
-    octagonGlow.material.opacity = Math.min(1, 0.3 + amplitude * 0.45 * speakingGlowIntensity);
+    octagonGlow.material.opacity = Math.min(1, 0.3 + amplitude * 0.45 * speakingGlowIntensity)
+      * (raphaelActive() ? 0.18 : 1.0);
     octagonGlowOuter.scale.setScalar(5.0 + amplitude * 5.5 * speakingGlowIntensity);
-    octagonGlowOuter.material.opacity = Math.min(1, 0.06 + amplitude * 0.2 * speakingGlowIntensity);
+    octagonGlowOuter.material.opacity = Math.min(1, 0.06 + amplitude * 0.2 * speakingGlowIntensity)
+      * (raphaelActive() ? 0.22 : 1.0);
     geometryGroup.scale.setScalar(WIREFRAME_SHRINK * wireframeScaleMultiplier * (1 + geoBreath + listenPulse * 0.2));
 
     coreGlow.scale.setScalar(6.5 + listenPulse * 2.2);
@@ -7960,11 +8073,14 @@ const MINI_CHAT_PAD = 3;
     renderer.clear();
     bgComposite.material.uniforms.uRgbOffset.value.set(0.009, 0.0036);
     if (raphaelActive()) {
-      bgComposite.material.uniforms.uGain.value = 1.55;
-      bgComposite.material.uniforms.uLift.value.set(0.20, 0.135, 0.055);
+      bgComposite.material.uniforms.uGain.value = 1.34;
+      bgComposite.material.uniforms.uLift.value.set(0.135, 0.09, 0.038);
+      bgComposite.material.uniforms.uWater.value = 0.0045 * waterStrength;
+      bgComposite.material.uniforms.uWaterT.value = t;
     } else {
       bgComposite.material.uniforms.uGain.value = 1.0;
       bgComposite.material.uniforms.uLift.value.set(0, 0, 0);
+      bgComposite.material.uniforms.uWater.value = 0.0;
     }
     // fgComposite's offset stays at (0,0) - see note above, never touched here.
     renderer.render(bgComposite.scene, warpCamera);
@@ -9302,6 +9418,10 @@ const MINI_CHAT_PAD = 3;
       'bloom-slider': '105',
       'bloom-spread-slider': '165',
       'glare-slider': '140',
+      'water-slider': '135',
+      // Out to the midpoint between the core and the first ring of
+      // script, which is where the reference puts the twelve-sided rim.
+      'octagon-scale-slider': '300',
     },
   };
 
@@ -9645,6 +9765,9 @@ const MINI_CHAT_PAD = 3;
   document.getElementById('glare-slider').addEventListener('input', (e) => {
     glareStrength = Number(e.target.value) / 100;
   });
+  document.getElementById('water-slider').addEventListener('input', (e) => {
+    waterStrength = Number(e.target.value) / 100;
+  });
   document.getElementById('panel-darkness-slider').addEventListener('input', (e) => {
     // Plain CSS variable rather than touching the rule directly, so the
     // panel's own stylesheet stays the single source of truth for how
@@ -9706,6 +9829,7 @@ const MINI_CHAT_PAD = 3;
   addResetOnDoubleClick(document.getElementById('bloom-slider'), 100);
   addResetOnDoubleClick(document.getElementById('bloom-spread-slider'), 100);
   addResetOnDoubleClick(document.getElementById('glare-slider'), 100);
+  addResetOnDoubleClick(document.getElementById('water-slider'), 100);
   addResetOnDoubleClick(document.getElementById('panel-darkness-slider'), 60);
   addResetOnDoubleClick(document.getElementById('speaking-pulse-slider'), 100);
   addResetOnDoubleClick(document.getElementById('speaking-glow-slider'), 200);
