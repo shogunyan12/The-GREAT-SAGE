@@ -1974,6 +1974,15 @@ body.mini:hover #mini-exit { opacity: 1; }
            sliders: everything is still one click away, but only the group
            you're actually adjusting is open at a time. -->
       <div id="advanced-panel" hidden>
+        <label class="slider-label">Theme</label>
+        <select id="theme-select">
+          <option value="great-sage">Great Sage</option>
+          <option value="raphael">Raphael</option>
+        </select>
+        <div class="setting-hint">Every setting in the groups below belongs
+          to the selected theme. Change one and it saves to that theme only
+          &mdash; switch back and the other is exactly as you left it.</div>
+
         <details class="settings-group" open>
           <summary>Colour</summary>
           <div class="color-swatch-row">
@@ -8260,6 +8269,102 @@ const MINI_CHAT_PAD = 3;
       el.id === 'voice-clips-master-toggle'
     );
   }
+  // ---------- Themes ----------
+  // A theme owns every control inside the .settings-group blocks - the
+  // colours, scales, counts, opacities and warp that make up the look of
+  // the scene. Nothing else: volume, captions, voice, the push-to-talk
+  // key and the interface sounds are the same whichever theme is on.
+  //
+  // The boundary is the MARKUP, not a list of ids. A slider added to one
+  // of those groups later is themed automatically, and one added below
+  // them is not - which is the same rule a reader would infer from
+  // looking at the panel.
+  //
+  // The overlay comes free: it is this same page and this same scene, so
+  // it follows whatever theme is active without knowing themes exist.
+  const themeSelect = document.getElementById('theme-select');
+
+  // Raphael's starting point, not its final look - every value here is a
+  // slider Krazaa can move, and moving it saves to Raphael rather than to
+  // Great Sage. Deliberately a clear departure so the switch is obvious
+  // before any tuning happens.
+  const THEME_SEEDS = {
+    raphael: {
+      'bg-base-color-picker': '#2a1a4d',
+      'bg-accent-color-picker': '#c9a227',
+      'theme-color-picker': '#ffeec2',
+      'chroma-slider': '140',
+      'corner-warp-slider': '30',
+      'magic-circle-slider': '95',
+      'magic-circle-opacity-slider': '45',
+      'outer-ring-scale-slider': '95',
+      'rings-slider': '130',
+      'laser-opacity-slider': '80',
+      'particle-count-slider': '240',
+      'infall-count-slider': '300',
+      'refract-slider': '130',
+      'speaking-glow-slider': '260',
+    },
+  };
+
+  let activeTheme = 'great-sage';
+  const themeStore = {};          // theme id -> {control id: value}
+
+  // In a visual group, but not part of the VISUAL. Panel darkness sets a
+  // CSS variable on the settings panel itself - it is interface chrome,
+  // and Krazaa's line was "only the home visuals and the overlay, not the
+  // ui". So it stays global: the same whichever theme is on.
+  const THEME_EXCLUDE = { 'panel-darkness-slider': true };
+
+  function themedControls() {
+    if (!settingsSection) return [];
+    return Array.prototype.slice.call(
+      settingsSection.querySelectorAll('.settings-group input'))
+      .filter(function (el) { return !!el.id && !THEME_EXCLUDE[el.id]; });
+  }
+
+  function captureTheme() {
+    const out = {};
+    themedControls().forEach(function (el) {
+      out[el.id] = (el.type === 'checkbox') ? el.checked : el.value;
+    });
+    return out;
+  }
+
+  function applyThemeValues(vals) {
+    if (!vals) return;
+    const els = themedControls();
+    els.forEach(function (el) {
+      if (vals[el.id] === undefined) return;
+      if (el.type === 'checkbox') el.checked = !!vals[el.id];
+      else el.value = vals[el.id];
+    });
+    // Set every value FIRST, then fire the events. Some of these read
+    // each other when they recompute, and interleaving the two would
+    // have the scene rebuilt against a half-applied theme.
+    els.forEach(function (el) {
+      el.dispatchEvent(new Event(
+        el.type === 'checkbox' ? 'change' : 'input'));
+    });
+  }
+
+  function switchTheme(next) {
+    if (!next || next === activeTheme) return;
+    // Remember what is being left behind, including edits made since it
+    // was selected. This is also what seeds Great Sage the first time -
+    // its values are simply whatever is on screen right now.
+    themeStore[activeTheme] = captureTheme();
+    activeTheme = next;
+    applyThemeValues(themeStore[next] || THEME_SEEDS[next] || null);
+    scheduleSaveSettings();
+  }
+
+  if (themeSelect) {
+    themeSelect.addEventListener('change', function () {
+      switchTheme(themeSelect.value);
+    });
+  }
+
   function collectSettings() {
     const out = {};
     settingsSection.querySelectorAll('input').forEach((el) => {
@@ -8278,6 +8383,13 @@ const MINI_CHAT_PAD = 3;
     // scan above would only ever capture whichever sound the picker
     // happened to be showing.
     out['sfx-gains'] = JSON.stringify(SFX_GAIN);
+    // Themes, and which one is on. The flat values scanned above are the
+    // ACTIVE theme's live state - this captures them into that theme so
+    // an edit made and then never switched away from is still saved
+    // against the right one.
+    themeStore[activeTheme] = captureTheme();
+    out['themes'] = JSON.stringify(themeStore);
+    out['active-theme'] = activeTheme;
     // Caption position - dragged, not an <input>, so like ptt-combo it
     // has to be picked up explicitly. Read from the live layout rather
     // than the inline style, so it is captured correctly even before the
@@ -8293,6 +8405,19 @@ const MINI_CHAT_PAD = 3;
   }
   function applySettings(saved) {
     if (!saved || typeof saved !== 'object') return;
+    if (typeof saved['themes'] === 'string') {
+      try {
+        const t = JSON.parse(saved['themes']);
+        Object.keys(t).forEach(function (k) { themeStore[k] = t[k]; });
+      } catch (err) { /* a corrupt blob must not stop the rest loading */ }
+    }
+    if (typeof saved['active-theme'] === 'string' && saved['active-theme']) {
+      // Only the record of which theme is on. The values themselves were
+      // already applied by the generic scan below, because the flat
+      // settings ARE the active theme - re-applying here would fight it.
+      activeTheme = saved['active-theme'];
+      if (themeSelect) themeSelect.value = activeTheme;
+    }
     if (typeof saved['sfx-gains'] === 'string') {
       try {
         const g = JSON.parse(saved['sfx-gains']);
