@@ -769,7 +769,10 @@
   }
   body.startup-intro {
     filter: blur(36px) brightness(0.08);
-    transform: scale(1.28);
+    /* Slightly UNDER size, so the page eases outward with the burst
+       rather than shrinking against it. It was 1.28 - a zoom-in, which
+       made sense when the scene itself started oversized. */
+    transform: scale(0.94);
   }
   /* Body's OWN base rule already has a permanent 380ms transition on
      filter/transform - just adding startup-intro would EASE INTO the
@@ -2027,6 +2030,8 @@ body.mini:hover #mini-exit { opacity: 1; }
 
         <details class="settings-group">
           <summary>Model</summary>
+          <label class="slider-label">Ring sides (8 = octagon, 12 = dodecagon)</label>
+          <input type="range" id="octagon-sides-slider" min="3" max="16" step="1" value="8">
           <label class="slider-label">Wireframe</label>
           <input type="range" id="wireframe-scale-slider" min="50" max="300" value="100">
           <label class="slider-label">Core</label>
@@ -3896,6 +3901,11 @@ Hey Ciel</textarea>
     // reacted to amplitude, so the octagon looked flat/unchanged next to
     // its own now-pulsing glow sprites.
     uAmplitude: { value: 0 },
+    // How many sides the speaking ring has. Eight is Great Sage;
+    // Raphael is a dodecagon. Driven by a slider rather than a
+    // constant, so it belongs to whichever theme is selected like
+    // every other visual value.
+    uSides: { value: 8 },
   };
   const octagonMat = new THREE.ShaderMaterial({
     uniforms: octagonUniforms,
@@ -3917,6 +3927,7 @@ Hey Ciel</textarea>
       uniform float uStretchY;
       uniform vec3 uColor;
       uniform float uAmplitude;
+      uniform float uSides;
 
       // Cheap regular-octagon distance field - flat sides, sharp
       // corners, unlike a smooth circular falloff. The stretch divides
@@ -3935,6 +3946,22 @@ Hey Ciel</textarea>
         // Applied after the stretch divide on purpose: the stretch stays
         // in screen axes, so speech still widens the ring horizontally
         // while the silhouette itself is the rotated one.
+        if (uSides > 8.5 || uSides < 7.5) {
+          // Any other side count. Standard regular-polygon distance,
+          // normalised the same way the octagon below is - vertices at
+          // radius 1 - so changing the count resizes nothing.
+          //
+          // The half-turn offset puts a VERTEX at the top, matching the
+          // orientation the octagon was rotated into for the same reason:
+          // the speaking ring expanding off a flat edge looked wrong.
+          float seg = 6.2831853 / uSides;
+          float a = atan(sp.y, sp.x) - 1.5707963;
+          return length(sp) * cos(mod(a, seg) - seg * 0.5) / cos(seg * 0.5);
+        }
+        // EIGHT SIDES: the original, untouched. Great Sage's look must not
+        // move because a second theme was added, and the surest way to
+        // promise that is to leave its arithmetic exactly where it was
+        // rather than trust a general formula to land on the same pixels.
         const float A = 0.3926991;            // pi/8
         float c = cos(A), s = sin(A);
         sp = vec2(sp.x * c - sp.y * s, sp.x * s + sp.y * c);
@@ -6557,13 +6584,22 @@ const MINI_CHAT_PAD = 3;
     t += 0.01 * frameScale;
     if (miniMode) updateCubeSpin(_now / 1000, dt);
 
-    // Startup zoom: the whole visual starts inflated and eases down to
-    // its real size, like a camera racking into focus - layered on top
-    // of the CSS blur/brightness fade (see playStartupIntro), not a
-    // replacement for it. Clamped to 1 so it's a no-op after the intro.
+    // Startup: the visual bursts OUT of the centre, overshoots its
+    // resting size and settles back - the reference Krazaa gave is an
+    // explosion, everything thrown outward from a point and then pulled
+    // back a little. It used to be the opposite, starting oversized and
+    // shrinking inward like a camera racking into focus.
+    //
+    // easeOutBack does both halves in one curve: fast away from zero,
+    // past 1, then back down to it. Layered on the CSS blur/brightness
+    // fade (see playStartupIntro), not a replacement for it. Clamped to
+    // 1 so it is a no-op once the intro is over.
     const zoomT = Math.min(1, (performance.now() - startupZoomStartTime) / STARTUP_ZOOM_MS);
-    const zoomEase = 1 - Math.pow(1 - zoomT, 3);
-    const startupScaleMult = 1 + (1 - zoomEase) * (STARTUP_ZOOM_START_MULT - 1);
+    const _p = zoomT - 1;
+    const zoomEase = 1 + (STARTUP_OVERSHOOT + 1) * _p * _p * _p
+                       + STARTUP_OVERSHOOT * _p * _p;
+    const startupScaleMult = STARTUP_ZOOM_START_MULT
+                           + (1 - STARTUP_ZOOM_START_MULT) * zoomEase;
     worldGroup.scale.setScalar(WORLD_GROUP_BASE_SCALE * startupScaleMult);
 
     warpUniforms.uTime.value = t * 10;
@@ -7613,8 +7649,15 @@ const MINI_CHAT_PAD = 3;
   // in worldGroup) starts at, easing down to its real size - the "camera
   // trying to focus" zoom, layered on top of the CSS blur/brightness
   // above rather than replacing it.
-  const STARTUP_ZOOM_MS = 900;
-  const STARTUP_ZOOM_START_MULT = 1.8;
+  const STARTUP_ZOOM_MS = 1100;
+  // Where the burst starts: collapsed to almost nothing at the centre,
+  // not inflated. Not exactly zero - at zero the first frame has no
+  // geometry to light and the flash reads as a gap rather than a spark.
+  const STARTUP_ZOOM_START_MULT = 0.06;
+  // How far past its resting size it throws before settling. The classic
+  // easeOutBack constant, which overshoots by about a tenth - enough to
+  // read as a bounce, not so much that it looks like a wobble.
+  const STARTUP_OVERSHOOT = 1.70158;
   let startupZoomStartTime = performance.now();
 
   function playStartupIntro() {
@@ -8289,21 +8332,36 @@ const MINI_CHAT_PAD = 3;
   // Great Sage. Deliberately a clear departure so the switch is obvious
   // before any tuning happens.
   const THEME_SEEDS = {
+    // Raphael, from the reference: a white-hot core inside concentric
+    // gold glyph rings, radial light spears, the whole frame blown out
+    // with warm bloom and a teal-green fringe at the edges.
+    //
+    // Read off the picture rather than invented - gold on the rings and
+    // the wash, near-white at the centre, and the two things that carry
+    // the look are the magic circle (those glyph rings ARE the image)
+    // and the lasers (the spears). Both go up hard.
     raphael: {
-      'bg-base-color-picker': '#2a1a4d',
-      'bg-accent-color-picker': '#c9a227',
-      'theme-color-picker': '#ffeec2',
-      'chroma-slider': '140',
-      'corner-warp-slider': '30',
-      'magic-circle-slider': '95',
-      'magic-circle-opacity-slider': '45',
-      'outer-ring-scale-slider': '95',
-      'rings-slider': '130',
-      'laser-opacity-slider': '80',
-      'particle-count-slider': '240',
-      'infall-count-slider': '300',
-      'refract-slider': '130',
-      'speaking-glow-slider': '260',
+      // White-gold core, gold accent, deep teal base for the fringe.
+      'theme-color-picker': '#ffe6a8',
+      'bg-accent-color-picker': '#e8a317',
+      'bg-base-color-picker': '#14453f',
+      // The glyph rings are the signature of the whole image.
+      'magic-circle-opacity-slider': '120',
+      'magic-circle-slider': '110',
+      // The spears of light thrown outward.
+      'laser-opacity-slider': '150',
+      'rings-slider': '160',
+      // Bloom and chromatic spill - the reference is drowning in it.
+      'chroma-slider': '180',
+      'refract-slider': '150',
+      'corner-warp-slider': '40',
+      'speaking-glow-slider': '300',
+      // Denser motes, matching the sparks packed through the frame.
+      'particle-count-slider': '260',
+      'infall-count-slider': '320',
+      'outer-ring-scale-slider': '100',
+      // The upgrade Krazaa named: eight sides become twelve.
+      'octagon-sides-slider': '12',
     },
   };
 
@@ -8529,6 +8587,10 @@ const MINI_CHAT_PAD = 3;
     });
   }
   collectModelMaterials();
+
+  document.getElementById('octagon-sides-slider').addEventListener('input', (e) => {
+    octagonUniforms.uSides.value = parseFloat(e.target.value) || 8;
+  });
 
   document.getElementById('outer-ring-scale-slider').addEventListener('input', (e) => {
     outerRingScaleMultiplier = Number(e.target.value) / 100;
