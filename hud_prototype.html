@@ -4222,12 +4222,26 @@ Hey Ciel</textarea>
   // Sized off the reference rather than guessed: the first circle of
   // script covers most of the frame, the second runs out past the
   // corners, and a thin hoop sits just outside the twelve-sided ring.
-  const runeInner = makeRuneBand(11.5,
-    makeRuneBandTexture(1024, 40, 0.355, 0.395, 3.5), 0.8);
-  const runeOuter = makeRuneBand(19.0,
-    makeRuneBandTexture(2048, 74, 0.30, 0.425, 7.0), 1.0);
-  const runeBorder = makeRuneBand(36.0,
-    makeRuneBandTexture(2048, 120, 0.355, 0.455, 6.0), 0.55);
+  //
+  // a/b are where the band sits as a fraction of its own plane, so its
+  // radius in world units is size*a to size*b. The water below is masked
+  // from these same numbers rather than from a second set copied by
+  // hand - move a ring and the gap the ripples run in moves with it.
+  const RUNE_SPEC = {
+    // Thicker than it was (0.355-0.395): at that width the innermost
+    // ring read as a hairline next to the outer one instead of as a
+    // band of script. Wider band, heavier stroke, and more glyphs to
+    // keep the spacing even now that there is more room around it.
+    inner:  { size: 11.5, a: 0.330, b: 0.420 },
+    outer:  { size: 19.0, a: 0.300, b: 0.425 },
+    border: { size: 36.0, a: 0.355, b: 0.455 },
+  };
+  const runeInner = makeRuneBand(RUNE_SPEC.inner.size,
+    makeRuneBandTexture(1024, 46, RUNE_SPEC.inner.a, RUNE_SPEC.inner.b, 5.5), 0.8);
+  const runeOuter = makeRuneBand(RUNE_SPEC.outer.size,
+    makeRuneBandTexture(2048, 74, RUNE_SPEC.outer.a, RUNE_SPEC.outer.b, 7.0), 1.0);
+  const runeBorder = makeRuneBand(RUNE_SPEC.border.size,
+    makeRuneBandTexture(2048, 120, RUNE_SPEC.border.a, RUNE_SPEC.border.b, 6.0), 0.55);
   runeInner.position.z = 0.02;
   runeOuter.position.z = 0.01;
   runeBorder.position.z = -0.4;
@@ -4302,11 +4316,22 @@ Hey Ciel</textarea>
   // single additive sheet rather than as real distortion, which would
   // need the scene rendered to a target first for no visible gain at
   // this blur.
+  const RIPPLE_SHEET_SIZE = 30;
   const rippleMat = new THREE.ShaderMaterial({
     uniforms: {
       uTime: { value: 0 },
       uColor: { value: new THREE.Color(0xffd070) },
       uStrength: { value: 0.5 },
+      // World radii, from RUNE_SPEC. The water starts where the inner
+      // ring ends, stops where the border ring begins, and is cut away
+      // over the middle ring - so it only ever runs in the gaps BETWEEN
+      // the rings and never washes across the script itself.
+      uSheet: { value: RIPPLE_SHEET_SIZE },
+      uFrom: { value: RUNE_SPEC.inner.size * RUNE_SPEC.inner.b },
+      uTo: { value: RUNE_SPEC.border.size * RUNE_SPEC.border.a },
+      uMid: { value: new THREE.Vector2(
+        RUNE_SPEC.outer.size * RUNE_SPEC.outer.a,
+        RUNE_SPEC.outer.size * RUNE_SPEC.outer.b) },
     },
     transparent: true,
     depthWrite: false,
@@ -4323,6 +4348,18 @@ Hey Ciel</textarea>
       uniform float uTime;
       uniform vec3 uColor;
       uniform float uStrength;
+      uniform float uSheet;
+      uniform float uFrom;
+      uniform float uTo;
+      uniform vec2 uMid;
+
+      // 1 inside a ring, 0 outside it, with a soft shoulder so the water
+      // fades under the script rather than ending at a hard rim.
+      float ringMask(float R, vec2 ring) {
+        float pad = 0.55;
+        return smoothstep(ring.x - pad, ring.x + pad, R)
+             * (1.0 - smoothstep(ring.y - pad, ring.y + pad, R));
+      }
 
       void main() {
         vec2 p = vUv - 0.5;
@@ -4336,33 +4373,58 @@ Hey Ciel</textarea>
                 + sin(r * 71.0 - uTime * 2.2 - a * 3.0) * 0.4;
         w = w * 0.5 + 0.5;
 
-        // Only in the gap: faded out at the core and again past the
-        // outer circle, so the water never washes over either of them.
-        float inner = smoothstep(0.055, 0.16, r);
-        float outer = 1.0 - smoothstep(0.34, 0.5, r);
-        float band = inner * outer;
+        // Only in the gaps. r is in UV, so scale it back to the world
+        // units the ring radii are expressed in before comparing.
+        float R = r * uSheet;
+        float band = smoothstep(uFrom, uFrom + 0.9, R)
+                   * (1.0 - smoothstep(uTo - 1.6, uTo, R))
+                   * (1.0 - ringMask(R, uMid));
 
         float v = pow(w, 3.0) * band * uStrength;
         gl_FragColor = vec4(uColor * v, v * 0.85);
       }
     `,
   });
-  const rippleSheet = new THREE.Mesh(new THREE.PlaneGeometry(30, 30), rippleMat);
+  const rippleSheet = new THREE.Mesh(
+    new THREE.PlaneGeometry(RIPPLE_SHEET_SIZE, RIPPLE_SHEET_SIZE), rippleMat);
   rippleSheet.position.z = -0.5;
   raphaelGroup.add(rippleSheet);
 
-  const GREAT_SAGE_ONLY = [cubeRingGroup, outerCubeRingGroup, shardGroup,
-                          magicCircle, geometryGroup, starField];
+  // Resolved when it is called, NOT built here. starField is declared
+  // several hundred lines further down this same scope, so naming it in
+  // an array up here was a temporal-dead-zone ReferenceError that threw
+  // during init and took the entire inline script with it: a blank HUD,
+  // and nothing in the log, because the page-error reporter is installed
+  // below this point and never got to run.
+  function greatSageOnly() {
+    return [cubeRingGroup, outerCubeRingGroup, shardGroup, magicCircle,
+            geometryGroup,
+            typeof starField !== 'undefined' ? starField : null];
+  }
 
   // Remembered, so anything that disturbs visibility can put the theme
   // back without needing to know which one is on - see applyMiniMode.
   let appliedThemeScene = 'great-sage';
 
+  // Asked by the animation loop. Setting .visible once in applyThemeScene
+  // is not enough for anything the loop drives: the shooters, the infall
+  // dots and the magic circle all assign .visible every single frame from
+  // their own state, which quietly switched them back on one frame after
+  // the theme hid them. That is why squares and circles kept drifting
+  // through Raphael even though the theme had already hidden them.
+  function raphaelActive() { return appliedThemeScene === 'raphael'; }
+
   function applyThemeScene(id) {
     appliedThemeScene = id;
     const raphael = (id === 'raphael');
     raphaelGroup.visible = raphael;
-    GREAT_SAGE_ONLY.forEach(function (o) { if (o) o.visible = !raphael; });
+    // The beam running down from the core to the bottom of the frame is
+    // a DOM element (#core-pole), not scene geometry, so it survives
+    // everything below and has to be hidden separately. Raphael has no
+    // beam - the core is a star, not a projector.
+    const pole = document.getElementById('core-pole');
+    if (pole) pole.style.display = raphael ? 'none' : '';
+    greatSageOnly().forEach(function (o) { if (o) o.visible = !raphael; });
     // Loose arrays rather than groups, so they are switched here instead
     // of in the list above.
     //
@@ -7181,8 +7243,9 @@ const MINI_CHAT_PAD = 3;
     // Ambient base speed, plus an optional speech-driven term that is
     // zero unless the "Speech reaction" slider is turned up.
     const shooterSpeed = 0.011 + amplitude * 0.075 * particleSpeechReact;
+    const noDebris = raphaelActive();
     shooters.forEach((s, idx) => {
-      s.visible = idx < activeShooterCount;
+      s.visible = !noDebris && idx < activeShooterCount;
       if (!s.visible) return;
       s.userData.dist += shooterSpeed * s.userData.speed;
       // Kept: a slight curve so they drift rather than tracking dead
@@ -7206,7 +7269,7 @@ const MINI_CHAT_PAD = 3;
     // Same optional speech term as the squares above.
     const infallSpeed = 0.013 + amplitude * 0.040 * particleSpeechReact;
     infallDots.forEach((d, idx) => {
-      d.visible = idx < activeInfallCount;
+      d.visible = !noDebris && idx < activeInfallCount;
       if (!d.visible) return;
       const u = d.userData;
       // Acceleration grows as it nears the centre, like something
@@ -8983,7 +9046,7 @@ const MINI_CHAT_PAD = 3;
     // Hidden outright at 0 rather than just scaled to nothing, so it
     // stops being drawn at all instead of collapsing into a bright speck
     // behind the core.
-    magicCircle.visible = scale > 0;
+    magicCircle.visible = scale > 0 && !raphaelActive();
     magicCircle.scale.setScalar(scale);
   });
   let speakingPulseIntensity = 1;
