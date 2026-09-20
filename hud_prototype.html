@@ -3960,16 +3960,19 @@ Hey Ciel</textarea>
       const rnd2 = seed2 - Math.floor(seed2);
 
       const a = (i / RAYS) * Math.PI * 2 + (rnd - 0.5) * 0.035;
-      const len = rMax * (0.60 + rnd2 * 0.39);
+      const len = rMax * (0.84 + rnd2 * 0.16);
       const grad = g.createLinearGradient(cx, cy,
                                           cx + Math.cos(a) * len,
                                           cy + Math.sin(a) * len);
-      const alpha = 0.30 + rnd * 0.55;
-      grad.addColorStop(0.0, 'rgba(255,248,230,' + alpha + ')');
-      grad.addColorStop(0.35, 'rgba(255,214,130,' + (alpha * 0.66) + ')');
-      grad.addColorStop(1.0, 'rgba(255,180,70,0)');
+      const alpha = 0.42 + rnd * 0.55;
+      // Holds its brightness most of the way out and then stops, which
+      // is what separates a beam from a soft spoke.
+      grad.addColorStop(0.00, 'rgba(255,252,240,' + alpha + ')');
+      grad.addColorStop(0.55, 'rgba(255,236,180,' + (alpha * 0.88) + ')');
+      grad.addColorStop(0.86, 'rgba(255,206,110,' + (alpha * 0.55) + ')');
+      grad.addColorStop(1.00, 'rgba(255,180,70,0)');
       g.strokeStyle = grad;
-      g.lineWidth = 0.8 + rnd2 * 1.3;
+      g.lineWidth = 0.7 + rnd2 * 0.9;
       g.beginPath();
       g.moveTo(cx, cy);
       g.lineTo(cx + Math.cos(a) * len, cy + Math.sin(a) * len);
@@ -3995,7 +3998,7 @@ Hey Ciel</textarea>
   }
 
   const miniBurst = new THREE.Mesh(
-    new THREE.PlaneGeometry(5.7, 5.7),
+    new THREE.PlaneGeometry(6.2, 6.2),
     new THREE.MeshBasicMaterial({
       map: makeBurstTexture(512),
       transparent: true,
@@ -4728,7 +4731,10 @@ Hey Ciel</textarea>
       g.restore();
     }
     const tex = new THREE.CanvasTexture(c);
-    tex.anisotropy = 4;
+    // 16, not 4. In the overlay this band is minified to about a third
+    // of its home size, and anisotropy is what keeps the strokes from
+    // smearing into each other when it is.
+    tex.anisotropy = 16;
     return tex;
   }
 
@@ -4770,8 +4776,10 @@ Hey Ciel</textarea>
     outer:  { size: 19.0, a: 0.300, b: 0.425 },
     border: { size: 36.0, a: 0.355, b: 0.455 },
   };
+  // 2048 rather than 1024: this is the ONE band the overlay shows, and
+  // it is the band that gets minified hardest there.
   const runeInner = makeRuneBand(RUNE_SPEC.inner.size,
-    makeRuneBandTexture(1024, 46, RUNE_SPEC.inner.a, RUNE_SPEC.inner.b, 5.5), 0.8);
+    makeRuneBandTexture(2048, 46, RUNE_SPEC.inner.a, RUNE_SPEC.inner.b, 9.0), 0.8);
   const runeOuter = makeRuneBand(RUNE_SPEC.outer.size,
     makeRuneBandTexture(2048, 74, RUNE_SPEC.outer.a, RUNE_SPEC.outer.b, 7.0), 1.0);
   const runeBorder = makeRuneBand(RUNE_SPEC.border.size,
@@ -5194,6 +5202,7 @@ Hey Ciel</textarea>
       // The overlay centres the scene; put the slider's offset back.
       const posY = document.getElementById('visual-pos-y-slider');
       if (posY) worldGroup.position.y = Number(posY.value);
+      runeInner.material.opacity = 0.8;
     }
     // The beam running down from the core to the bottom of the frame is
     // a DOM element (#core-pole), not scene geometry, so it survives
@@ -5205,8 +5214,11 @@ Hey Ciel</textarea>
     // strength together they read as a hard disc inside a soft one.
     coreShine.visible = raphael;
     if (!miniMode) {
-      // The overlay's stand-in never appears in the home scene.
+      // The overlay's stand-in never appears in the home scene, and the
+      // rim goes back to the theme's colour.
       miniBurst.visible = false;
+      const picker = document.getElementById('theme-color-picker');
+      if (picker) octagonUniforms.uColor.value.set(picker.value);
       coreShineMat.uniforms.uStreak.value = 1.0;
       coreShineMat.uniforms.uStrength.value = 1.0;
     }
@@ -5427,6 +5439,7 @@ Hey Ciel</textarea>
     // only here.
     coreShine.visible = false;
     miniBurst.visible = true;
+    octagonUniforms.uColor.value.setRGB(1, 1, 1);
     // Great Sage's star sprite throws ONE four-pointed cross, and at
     // overlay size it was the brightest thing inside the ring - reading
     // as a sparkle sitting on the emblem rather than as the dense fan of
@@ -5434,6 +5447,9 @@ Hey Ciel</textarea>
     lensFlareMat.opacity = 0;
     octagonMat.uniforms.uSoft.value = MINI_RAPHAEL.soft;
     runeInner.visible = true;
+    // Full strength here. At 0.8 the glyphs sat noticeably below the
+    // brightness of the circles fencing them in.
+    runeInner.material.opacity = 1.0;
     runeOuter.visible = false;
     runeBorder.visible = false;
     bokehGroup.visible = false;
@@ -7952,10 +7968,10 @@ const MINI_CHAT_PAD = 3;
     // as a soft pulse rather than a hard size jump.
     octagonGlow.scale.setScalar(2.6 + amplitude * 2.6 * speakingGlowIntensity);
     octagonGlow.material.opacity = Math.min(1, 0.3 + amplitude * 0.45 * speakingGlowIntensity)
-      * (raphaelActive() ? 0.18 : 1.0);
+      * (raphaelActive() ? (miniMode ? 0.10 : 0.18) : 1.0);
     octagonGlowOuter.scale.setScalar(5.0 + amplitude * 5.5 * speakingGlowIntensity);
     octagonGlowOuter.material.opacity = Math.min(1, 0.06 + amplitude * 0.2 * speakingGlowIntensity)
-      * (raphaelActive() ? 0.22 : 1.0);
+      * (raphaelActive() ? (miniMode ? 0.0 : 0.22) : 1.0);
     geometryGroup.scale.setScalar(WIREFRAME_SHRINK * wireframeScaleMultiplier * (1 + geoBreath + listenPulse * 0.2));
 
     coreGlow.scale.setScalar(6.5 + listenPulse * 2.2);
