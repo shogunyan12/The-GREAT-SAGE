@@ -2892,7 +2892,11 @@ Hey Ciel</textarea>
       vec3 c = texture2D(uL0, vUv).rgb * uWeights.x
              + texture2D(uL1, vUv).rgb * uWeights.y
              + texture2D(uL2, vUv).rgb * uWeights.z;
-      gl_FragColor = vec4(c * uIntensity * uTint, 1.0);
+      vec3 lit = c * uIntensity * uTint;
+      // NOT 1.0. See the note on the mini render path: this pass is
+      // additive, alpha blends with the same factors as colour, and a
+      // flat 1 here makes the transparent overlay opaque.
+      gl_FragColor = vec4(lit, clamp(max(max(lit.r, lit.g), lit.b), 0.0, 1.0));
     }
   `, {
     uL0: { value: bloomA[0].texture },
@@ -3919,6 +3923,116 @@ Hey Ciel</textarea>
   lensFlareMat.userData.baseOpacity = lensFlareMat.opacity;
   coreVisualsGroup.add(lensFlare);
 
+  // ---- The overlay's burst ----
+  // The same thing coreShineMat draws, drawn a different way, and only
+  // for the overlay.
+  //
+  // coreShineMat renders correctly in the main window (WebView2, current
+  // Edge) and does not render AT ALL in the overlay, which is
+  // QtWebEngine 6.4.3 - Chromium 102, from 2022. Everything checked out
+  // from inside that process: the mesh visible, in frustum, scaled
+  // right, uniforms right, bloom irrelevant, nothing writing depth over
+  // it. Replacing its fragment shader with a three-line one that cannot
+  // fail changed nothing either, so it is not the shader source. Whatever
+  // that old GL stack objects to, it objects silently, and the overlay
+  // cannot be given a console to ask.
+  //
+  // A canvas texture on a plane is the technique the ring of script
+  // already uses, and that renders in the overlay perfectly. So the
+  // overlay gets this and the home scene keeps the shader - which also
+  // means the home scene is not touched by any of it.
+  function makeBurstTexture(size) {
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const g = c.getContext('2d');
+    const cx = size / 2, cy = size / 2;
+    const rMax = size * 0.5;
+
+    // The rays. Fine, uneven, and reaching different distances - the
+    // reference's middle is a dense fan, not a handful of spokes.
+    const RAYS = 230;
+    for (let i = 0; i < RAYS; i++) {
+      // Deterministic, so the burst is identical every launch rather
+      // than reshuffling into a different pattern each time.
+      const seed = Math.sin(i * 12.9898) * 43758.5453;
+      const rnd = seed - Math.floor(seed);
+      const seed2 = Math.sin(i * 78.233) * 12345.6789;
+      const rnd2 = seed2 - Math.floor(seed2);
+
+      const a = (i / RAYS) * Math.PI * 2 + (rnd - 0.5) * 0.035;
+      const len = rMax * (0.60 + rnd2 * 0.39);
+      const grad = g.createLinearGradient(cx, cy,
+                                          cx + Math.cos(a) * len,
+                                          cy + Math.sin(a) * len);
+      const alpha = 0.30 + rnd * 0.55;
+      grad.addColorStop(0.0, 'rgba(255,248,230,' + alpha + ')');
+      grad.addColorStop(0.35, 'rgba(255,214,130,' + (alpha * 0.66) + ')');
+      grad.addColorStop(1.0, 'rgba(255,180,70,0)');
+      g.strokeStyle = grad;
+      g.lineWidth = 0.8 + rnd2 * 1.3;
+      g.beginPath();
+      g.moveTo(cx, cy);
+      g.lineTo(cx + Math.cos(a) * len, cy + Math.sin(a) * len);
+      g.stroke();
+    }
+
+    // The burn the rays come out of, over the top of them so their inner
+    // ends disappear into it rather than all converging on a visible
+    // point.
+    const core = g.createRadialGradient(cx, cy, 0, cx, cy, rMax * 0.30);
+    core.addColorStop(0.00, 'rgba(255,255,252,0.98)');
+    core.addColorStop(0.16, 'rgba(255,244,212,0.70)');
+    core.addColorStop(0.50, 'rgba(255,200,104,0.24)');
+    core.addColorStop(1.00, 'rgba(255,170,60,0)');
+    g.fillStyle = core;
+    g.beginPath();
+    g.arc(cx, cy, rMax * 0.30, 0, Math.PI * 2);
+    g.fill();
+
+    const tex = new THREE.CanvasTexture(c);
+    tex.anisotropy = 4;
+    return tex;
+  }
+
+  const miniBurst = new THREE.Mesh(
+    new THREE.PlaneGeometry(5.7, 5.7),
+    new THREE.MeshBasicMaterial({
+      map: makeBurstTexture(512),
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      color: new THREE.Color(0xffffff),
+    }));
+  // WHY THIS EXISTS, and why the burst was invisible in the overlay for
+  // an hour of looking at it.
+  //
+  // THREE.AdditiveBlending sets SrcAlpha/One - and three applies those
+  // same factors to the ALPHA channel as well as to colour. So alpha
+  // comes out as a*a + dst: anything at half alpha contributes a
+  // quarter. Over the main window that is invisible as a problem,
+  // because the canvas is opaque and only colour is ever read. On the
+  // OVERLAY the alpha channel is what the compositor uses to decide how
+  // much of the window you can see - so mid-alpha content, which is most
+  // of a soft burst, was being squared away to nothing. The ring of
+  // script and the twelve-sided rim survived only because their alpha
+  // runs near 0.95, where squaring barely matters.
+  //
+  // Colour stays additive; alpha accumulates straight.
+  miniBurst.material.blending = THREE.CustomBlending;
+  miniBurst.material.blendEquation = THREE.AddEquation;
+  miniBurst.material.blendSrc = THREE.SrcAlphaFactor;
+  miniBurst.material.blendDst = THREE.OneFactor;
+  miniBurst.material.blendEquationAlpha = THREE.AddEquation;
+  miniBurst.material.blendSrcAlpha = THREE.OneFactor;
+  miniBurst.material.blendDstAlpha = THREE.OneFactor;
+  // Parented and ordered exactly like the ring of script rather than
+  // like the core's own layers. Everything added under coreVisualsGroup
+  // refused to draw in the overlay - a flat opaque disc included, so it
+  // was never the shader, the texture, the blending or the size - while
+  // raphaelGroup's children render there perfectly. Matching the thing
+  // that works beats explaining the thing that does not.
+  miniBurst.visible = false;        // overlay only, and Raphael only
+
   // ---- Raphael's core: a shine, not a disc ----
   // Krazaa: "the core looks more like a shine than a visible circle in
   // the middle". Great Sage's core is a solid sphere with a hard rim, and
@@ -3938,6 +4052,9 @@ Hey Ciel</textarea>
       uOuter: { value: new THREE.Color(1.0, 0.72, 0.24) },
       uStrength: { value: 1.0 },
       uSides: { value: 12.0 },
+      // 1 = the home scene, untouched. Above that the internal rays get
+      // brighter AND reach further, which is what the overlay needs.
+      uStreak: { value: 1.0 },
     },
     transparent: true,
     depthWrite: false,
@@ -3956,6 +4073,7 @@ Hey Ciel</textarea>
       uniform vec3 uOuter;
       uniform float uStrength;
       uniform float uSides;
+      uniform float uStreak;
 
       float hash(float n) { return fract(sin(n * 12.9898) * 43758.5453); }
 
@@ -3999,9 +4117,15 @@ Hey Ciel</textarea>
         float idx = floor(k * 96.0);
         float f = fract(k * 96.0) - 0.5;
         float h = hash(idx);
+        // The exponent is what decides how far a ray reaches. At
+        // uStreak 1 it is 1.4, exactly as the home scene has always had
+        // it; pushing uStreak up flattens it toward 0.55 so the rays run
+        // out to the rim instead of fading just past the middle.
+        float reach = mix(1.4, 0.55, clamp(uStreak - 1.0, 0.0, 1.0));
         float streak = smoothstep(mix(0.03, 0.20, h), 0.0, abs(f))
-                     * pow(max(0.0, 1.0 - rr), 1.4)
-                     * (0.30 + 0.70 * hash(idx + 5.0));
+                     * pow(max(0.0, 1.0 - rr), reach)
+                     * (0.30 + 0.70 * hash(idx + 5.0))
+                     * uStreak;
 
         // Right at rr = 1, so it traces the twelve-sided boundary.
         float rim = smoothstep(0.86, 0.99, rr) * smoothstep(1.10, 1.00, rr);
@@ -5022,6 +5146,8 @@ Hey Ciel</textarea>
       }
     `,
   });
+  raphaelGroup.add(miniBurst);
+
   const glareSheet = new THREE.Mesh(
     new THREE.PlaneGeometry(GLARE_PLANE, GLARE_PLANE), glareMat);
   // In FRONT of the script. In the reference the spikes cross over the
@@ -5058,6 +5184,17 @@ Hey Ciel</textarea>
     appliedThemeScene = id;
     const raphael = (id === 'raphael');
     raphaelGroup.visible = raphael;
+    // Put back whatever the overlay took away. This runs on the way out
+    // of mini mode (applyMiniMode calls __reapplyThemeScene), and must
+    // not fire while still IN it or the emblem would inflate back into
+    // the full scene inside the little window.
+    if (!miniMode) {
+      raphaelGroup.scale.setScalar(1);
+      raphaelGroup.children.forEach(function (c) { c.visible = true; });
+      // The overlay centres the scene; put the slider's offset back.
+      const posY = document.getElementById('visual-pos-y-slider');
+      if (posY) worldGroup.position.y = Number(posY.value);
+    }
     // The beam running down from the core to the bottom of the frame is
     // a DOM element (#core-pole), not scene geometry, so it survives
     // everything below and has to be hidden separately. Raphael has no
@@ -5067,6 +5204,12 @@ Hey Ciel</textarea>
     // The shine replaces the sphere rather than joining it. Left at full
     // strength together they read as a hard disc inside a soft one.
     coreShine.visible = raphael;
+    if (!miniMode) {
+      // The overlay's stand-in never appears in the home scene.
+      miniBurst.visible = false;
+      coreShineMat.uniforms.uStreak.value = 1.0;
+      coreShineMat.uniforms.uStrength.value = 1.0;
+    }
     coreSphereMat.uniforms.uSolid.value = raphael ? 0.10 : 1.0;
     // In plane-distance units, so at the 3x scale Raphael runs the ring
     // at this reads as a soft rim about half a world unit thick.
@@ -5144,6 +5287,40 @@ Hey Ciel</textarea>
   // several loops (bands, shooters, drifting dots, stars), and a
   // hide-list would silently miss anything added later.
   const MINI_KEEP = [coreGroup, haloGroup, cubeRingGroup];
+
+  // Raphael's overlay is not the home scene shrunk down - shrinking it
+  // would put three rings of script, a water sheet, a caustic sheet, a
+  // veil and a sixty-four spike glare fan inside a 340px square, and all
+  // but the script are FULL-FRAME planes: in a transparent window they
+  // do not read as atmosphere, they read as a filled box.
+  //
+  // What Krazaa's reference shows instead is an emblem: one ring of
+  // script, a pale ring inside it, and a small burst filling the middle.
+  // So the overlay keeps exactly those three things.
+  const MINI_KEEP_RAPHAEL = [coreGroup, haloGroup, raphaelGroup];
+
+  // Everything here is sized for a frame that is 16:9 and much bigger
+  // than this window, so each of the three survivors is brought in.
+  // Separate factors rather than one group scale, because they have to
+  // end up NESTED - the burn inside the pale ring, the pale ring inside
+  // the script - and at their home sizes the burn is actually wider than
+  // the ring of script it is supposed to sit in.
+  const MINI_RAPHAEL = {
+    band: 0.72,     // the ring of script
+    ring: 0.72,     // the twelve-sided rim
+    // Large enough to fill the disc inside the rim, small enough to stay
+    // inside it: the rim lands at about 2.1 world units here and the
+    // burn's radius is 3.58 times this.
+    core: 0.53,
+    streak: 2.0,    // rays out to the rim - see uStreak
+    soft: 0.24,     // a broader, paler rim than the home scene's
+    // The burn is the right SIZE at 0.53 - its radius lands just inside
+    // the rim - but on a transparent window with nothing else lighting
+    // the frame it came out as a dark disc. In the home scene it is one
+    // bright thing among many; here it is the only thing inside the
+    // ring, and it has to carry that on its own.
+    glow: 1.9,
+  };
   let miniMode = false;
 
   // World units per screen pixel at the octagon's depth, so the ring
@@ -5239,11 +5416,40 @@ Hey Ciel</textarea>
   // particle field survived into the overlay. Enforcing it last means
   // any future per-frame visibility write is overridden too, instead of
   // quietly reintroducing the bug.
+  // Only the band of script survives inside raphaelGroup. The whitelist
+  // above works on worldGroup's children, and all of these are one level
+  // further down, so it cannot reach them.
+  function applyRaphaelMiniLayout() {
+    worldGroup.position.y = 0;
+    raphaelGroup.scale.setScalar(MINI_RAPHAEL.band);
+    // The shader shine does not render in the overlay's GL at all -
+    // see makeBurstTexture. The canvas burst stands in for it here, and
+    // only here.
+    coreShine.visible = false;
+    miniBurst.visible = true;
+    // Great Sage's star sprite throws ONE four-pointed cross, and at
+    // overlay size it was the brightest thing inside the ring - reading
+    // as a sparkle sitting on the emblem rather than as the dense fan of
+    // fine rays the reference has. The shine's own streaks are that fan.
+    lensFlareMat.opacity = 0;
+    octagonMat.uniforms.uSoft.value = MINI_RAPHAEL.soft;
+    runeInner.visible = true;
+    runeOuter.visible = false;
+    runeBorder.visible = false;
+    bokehGroup.visible = false;
+    rippleSheet.visible = false;
+    causticSheet.visible = false;
+    hazeSheet.visible = false;
+    glareSheet.visible = false;
+  }
+
   function enforceMiniVisibility() {
+    const keep = raphaelActive() ? MINI_KEEP_RAPHAEL : MINI_KEEP;
     for (let i = 0; i < worldGroup.children.length; i++) {
       const child = worldGroup.children[i];
-      child.visible = MINI_KEEP.indexOf(child) !== -1;
+      child.visible = keep.indexOf(child) !== -1;
     }
+    if (raphaelActive()) applyRaphaelMiniLayout();
     // Shards are parented INTO geometryGroup (they ride its rotation), so
     // the whitelist above cannot reach them - they would survive as
     // floating debris around an otherwise bare wireframe.
@@ -7682,14 +7888,18 @@ const MINI_CHAT_PAD = 3;
     // settings-panel sliders (default 1, see near the end of this
     // script) - multiplied in on top of the existing idle breathing
     // rather than replacing it.
-    coreVisualsGroup.scale.setScalar(CORE_SHRINK * coreScaleMultiplier * hoverBounceScale * (1 + coreBreath + listenPulse * 0.16));
+    const raphMini = miniMode && raphaelActive();
+    coreVisualsGroup.scale.setScalar(CORE_SHRINK * coreScaleMultiplier * hoverBounceScale
+      * (1 + coreBreath + listenPulse * 0.16)
+      * (raphMini ? MINI_RAPHAEL.core : 1));
     // Rays live outside coreGroup (so they don't inherit its 3D tumble)
     // but still need to track the core's size, or their start points
     // drift away from the glow they're supposed to emerge from.
     coreRayGroup.scale.copy(coreVisualsGroup.scale);
     // OCTAGON_SHRINK pulls the speaking ring 20% closer in to the core
     // than it used to sit; the slider multiplies on top of that.
-    haloGroup.scale.setScalar(OCTAGON_SHRINK * octagonScaleMultiplier);
+    haloGroup.scale.setScalar(OCTAGON_SHRINK * octagonScaleMultiplier
+      * (miniMode && raphaelActive() ? MINI_RAPHAEL.ring : 1));
     cubeRingGroup.scale.setScalar(cubeRingScaleMultiplier * (1 + listenPulse * 0.14));
     // Shifted more of the pulse magnitude from outward to inward - the
     // horizontal stretch multiplies outward reach further, so it was
@@ -8034,10 +8244,20 @@ const MINI_CHAT_PAD = 3;
       renderer.clear(true, true, true);
       renderer.render(scene, camera);
 
+      // Raphael's emblem is lit by its bloom the same way the home
+      // scene is; without it the overlay is a hard-edged line drawing.
+      // Great Sage's overlay skips this entirely and is unchanged.
+      const miniBloom = raphaelActive() && bloomStrength > 0.001;
+      if (miniBloom) renderBloom(fgTarget.texture);
+
       renderer.setRenderTarget(null);
       renderer.setClearColor(0x000000, 0);
       renderer.clear();
       renderer.render(fgComposite.scene, warpCamera);
+      if (miniBloom) {
+        bloomComposite.material.uniforms.uIntensity.value = bloomStrength;
+        renderer.render(bloomComposite.scene, warpCamera);
+      }
       return;
     }
 
