@@ -13,6 +13,9 @@ speech recognition, and the voice.
 - **A HUD, not a text box.** A Three.js scene that reacts to speech and
   to what it is doing, with a compact always-on-top overlay mode that
   clicks straight through to whatever is behind it.
+- **Two looks.** Great Sage, and Raphael - a second scene with its own
+  bloom, glare and water, switched from a dropdown. Each keeps its own
+  settings.
 
 Named for the skill in *That Time I Got Reincarnated as a Slime*, and it
 addresses you as Master.
@@ -79,6 +82,20 @@ Say things like *"what time is it"*, *"open spotify"*, *"search the web
 for..."*, *"search on youtube for X and play the first video"*, *"look at
 my screen"*. Requests to DO something are carried out and not narrated -
 it opens the thing and says nothing.
+
+## Themes
+
+**Settings -> Theme** switches between **Great Sage** and **Raphael**.
+
+Only the home visuals and the overlay change. The interface, the voice,
+the chats and the keybinds are shared, and each theme keeps its own copy
+of every visual slider - move one on Raphael and Great Sage is untouched,
+switch back and your settings are still there.
+
+Raphael is a different scene rather than a different palette: a
+twelve-sided core, rings of turning script, and a screen-space bloom
+stage that Great Sage never runs. That stage costs about six points of
+GPU on a 3060 at 1904x1041, and only while Raphael is the active theme.
 
 ## Build a standalone exe
 
